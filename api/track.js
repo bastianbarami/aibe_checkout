@@ -26,8 +26,4 @@ export default async function handler(req, res) {
     return res.status(500).json({ ok:false, error: e.message });
   }
 }
-
-async function readJson(req){
-  const chunks=[]; for await (const c of req) chunks.push(c);
-  return JSON.parse(Buffer.concat(chunks).toString("utf8")||"{}");
-}
+async function readJson(req){ const c=[]; for await (const x of req) c.push(x); return JSON.parse(Buffer.concat(c).toString("utf8")||"{}"); }
