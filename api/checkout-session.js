@@ -1,7 +1,7 @@
 export default async function handler(req, res) {
   const ALLOWED = [
     "https://ai-business-engine.com",
-    "https://DEIN-STAGING.webflow.io"
+    "https://baramiai-c98bd4c508b71b1b1c91ae95c029fc.webflow.io"
   ];
   const origin = req.headers.origin || "";
   if (ALLOWED.includes(origin)) res.setHeader("Access-Control-Allow-Origin", origin);
@@ -15,7 +15,7 @@ export default async function handler(req, res) {
   const stripe = (await import("stripe")).default(stripeSecret);
 
   try {
-    const { plan="one_time", email="", name="", thankYouUrl } = await readJson(req);
+    const { plan="one_time", email="", name="", phone="", thankYouUrl } = await readJson(req);
 
     const PRICE_ONE_TIME = process.env.PRICE_ONE_TIME;
     const PRICE_SPLIT_2  = process.env.PRICE_SPLIT_2;
@@ -26,15 +26,18 @@ export default async function handler(req, res) {
     const price = map[plan]; if (!price) return res.status(400).json({ error:"Unknown plan" });
     const mode  = plan === "one_time" ? "payment" : "subscription";
 
-    // Customer für besseres Prefill
+    // Customer für Prefill + Phone
     let customerId;
     if (email) {
       const found = await stripe.customers.list({ email, limit: 1 });
       if (found.data.length) {
         customerId = found.data[0].id;
-        if (name && !found.data[0].name) await stripe.customers.update(customerId, { name });
+        const update = {};
+        if (name  && !found.data[0].name)  update.name  = name;
+        if (phone && !found.data[0].phone) update.phone = phone;
+        if (Object.keys(update).length) await stripe.customers.update(customerId, update);
       } else {
-        customerId = (await stripe.customers.create({ email, name })).id;
+        customerId = (await stripe.customers.create({ email, name, phone })).id;
       }
     }
 
