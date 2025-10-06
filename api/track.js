@@ -1,7 +1,7 @@
 export default async function handler(req, res) {
   const ALLOWED = [
     "https://ai-business-engine.com",
-    "https://DEIN-STAGING.webflow.io"   // <— deine Staging-Domain eintragen
+    "https://baramiai-c98bd4c508b71b1b1c91ae95c029fc.webflow.io"
   ];
   const origin = req.headers.origin || "";
   if (ALLOWED.includes(origin)) res.setHeader("Access-Control-Allow-Origin", origin);
@@ -10,7 +10,7 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).end("Method Not Allowed");
 
-  const webhookUrl = process.env.WEBHOOK_URL; // Make/Zapier/Webhook
+  const webhookUrl = process.env.WEBHOOK_URL;
   if (!webhookUrl) return res.status(500).json({ error: "Missing WEBHOOK_URL" });
 
   try {
@@ -26,4 +26,8 @@ export default async function handler(req, res) {
     return res.status(500).json({ ok:false, error: e.message });
   }
 }
-async function readJson(req){ const c=[]; for await (const x of req) c.push(x); return JSON.parse(Buffer.concat(c).toString("utf8")||"{}"); }
+
+async function readJson(req){
+  const chunks=[]; for await (const c of req) chunks.push(c);
+  return JSON.parse(Buffer.concat(chunks).toString("utf8")||"{}");
+}
