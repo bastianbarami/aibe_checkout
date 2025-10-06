@@ -1,57 +1,57 @@
-// api/checkout-session.js
-const Stripe = require('stripe');
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+export default async function handler(req, res) {
+  const ALLOWED = [
+    "https://ai-business-engine.com",
+    "https://DEIN-STAGING.webflow.io"
+  ];
+  const origin = req.headers.origin || "";
+  if (ALLOWED.includes(origin)) res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") return res.status(200).end();
+  if (req.method !== "POST") return res.status(405).end("Method Not Allowed");
 
-function monthsFromNow(months) {
-  const d = new Date();
-  d.setMonth(d.getMonth() + months);
-  return Math.floor(d.getTime() / 1000);
-}
-
-module.exports = async (req, res) => {
-  // CORS für deine Domain erlauben
-  res.setHeader('Access-Control-Allow-Origin', 'https://ai-business-engine.com');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  if (req.method === 'OPTIONS') return res.status(200).end();
-  if (req.method !== 'POST') return res.status(405).end('Method Not Allowed');
+  const stripeSecret = process.env.STRIPE_SECRET_KEY;
+  if (!stripeSecret) return res.status(500).json({ error:"Missing STRIPE_SECRET_KEY" });
+  const stripe = (await import("stripe")).default(stripeSecret);
 
   try {
-    const { plan } = req.body || {};
-    if (!plan) return res.status(400).json({ error: 'Missing plan' });
+    const { plan="one_time", email="", name="", thankYouUrl } = await readJson(req);
 
-    // Basis-Parameter für Embedded Checkout
-    const params = {
-      ui_mode: 'embedded',
-      // Wir geben Plan & Gesamtsumme mit, damit deine Thank-You das Pixel korrekt setzt
-      return_url: 'https://ai-business-engine.com/thank-you?plan=' + plan +
-                  '&total=' + (
-                    plan === 'one_time' ? 499 :
-                    plan === 'split_2' ? 515 :
-                    plan === 'split_3' ? 525 : 0
-                  ) +
-                  '&session_id={CHECKOUT_SESSION_ID}',
-    };
+    const PRICE_ONE_TIME = process.env.PRICE_ONE_TIME;
+    const PRICE_SPLIT_2  = process.env.PRICE_SPLIT_2;
+    const PRICE_SPLIT_3  = process.env.PRICE_SPLIT_3;
 
-    if (plan === 'one_time') {
-      params.mode = 'payment';
-      params.line_items = [{ price: process.env.PRICE_ONE_TIME, quantity: 1 }];
-    } else if (plan === 'split_2') {
-      params.mode = 'subscription';
-      params.line_items = [{ price: process.env.PRICE_SPLIT_2, quantity: 1 }];
-      params.subscription_data = { cancel_at: monthsFromNow(2) }; // endet automatisch nach 2 Monaten
-    } else if (plan === 'split_3') {
-      params.mode = 'subscription';
-      params.line_items = [{ price: process.env.PRICE_SPLIT_3, quantity: 1 }];
-      params.subscription_data = { cancel_at: monthsFromNow(3) }; // endet automatisch nach 3 Monaten
-    } else {
-      return res.status(400).json({ error: 'Invalid plan' });
+    const map   = { one_time: PRICE_ONE_TIME, split_2: PRICE_SPLIT_2, split_3: PRICE_SPLIT_3 };
+    const total = { one_time: 499,          split_2: 515,          split_3: 525 };
+    const price = map[plan]; if (!price) return res.status(400).json({ error:"Unknown plan" });
+    const mode  = plan === "one_time" ? "payment" : "subscription";
+
+    // Customer für besseres Prefill
+    let customerId;
+    if (email) {
+      const found = await stripe.customers.list({ email, limit: 1 });
+      if (found.data.length) {
+        customerId = found.data[0].id;
+        if (name && !found.data[0].name) await stripe.customers.update(customerId, { name });
+      } else {
+        customerId = (await stripe.customers.create({ email, name })).id;
+      }
     }
 
-    const session = await stripe.checkout.sessions.create(params);
+    const session = await stripe.checkout.sessions.create({
+      ui_mode: "embedded",
+      mode,
+      customer: customerId || undefined,
+      customer_email: customerId ? undefined : (email || undefined),
+      line_items: [{ price, quantity: 1 }],
+      automatic_payment_methods: { enabled: true },
+      return_url: `${thankYouUrl || "https://ai-business-engine.com/thank-you"}?plan=${plan}&total=${total[plan]}&session_id={CHECKOUT_SESSION_ID}`
+    });
+
     return res.status(200).json({ client_secret: session.client_secret });
   } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: e.message });
+    console.error("session error", e);
+    return res.status(500).json({ error: e.message || "session_error" });
   }
-};
+}
+async function readJson(req){ const c=[]; for await (const x of req) c.push(x); return JSON.parse(Buffer.concat(c).toString("utf8")||"{}"); }
