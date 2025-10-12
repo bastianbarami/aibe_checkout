@@ -1,8 +1,9 @@
 export default async function handler(req, res) {
   const ALLOWED = [
-    "https://ai-business-engine.com",
-    "https://baramiai-c98bd4c508b71b1b1c91ae95c029fc.webflow.io"
-  ];
+  "https://ai-business-engine.com",
+  "https://www.ai-business-engine.com",
+  "https://baramiai-c98bd4c508b71b1b1c91ae95c029fc.webflow.io"
+];
   const origin = req.headers.origin || "";
   if (ALLOWED.includes(origin)) res.setHeader("Access-Control-Allow-Origin", origin);
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
