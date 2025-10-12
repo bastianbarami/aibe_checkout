@@ -22,10 +22,20 @@ export default async function handler(req, res) {
     const PRICE_SPLIT_2  = process.env.PRICE_SPLIT_2;
     const PRICE_SPLIT_3  = process.env.PRICE_SPLIT_3;
 
-    const map   = { one_time: PRICE_ONE_TIME, split_2: PRICE_SPLIT_2, split_3: PRICE_SPLIT_3 };
+    const map = {
+  // “old” keys
+  one_time:       PRICE_ONE_TIME,
+  split_2:        PRICE_SPLIT_2,
+  split_3:        PRICE_SPLIT_3,
+  // Frontend keys
+  aibe_pif:       PRICE_ONE_TIME,
+  aibe_split_2:   PRICE_SPLIT_2,
+  aibe_split_3:   PRICE_SPLIT_3,
+};
     const total = { one_time: 499,          split_2: 515,          split_3: 525 };
     const price = map[plan]; if (!price) return res.status(400).json({ error:"Unknown plan" });
-    const mode  = plan === "one_time" ? "payment" : "subscription";
+    const subscriptionPlans = new Set(["split_2","aibe_split_2","split_3","aibe_split_3"]);
+const mode = subscriptionPlans.has(plan) ? "subscription" : "payment";
 
     // Customer für Prefill + Phone
     let customerId;
