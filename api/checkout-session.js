@@ -1,6 +1,5 @@
 // api/checkout-session.js
 export default async function handler(req, res) {
-  // --- CORS (Domains, nicht einzelne Unterseiten nötig) ---
   const ALLOWED = [
     "https://ai-business-engine.com",
     "https://www.ai-business-engine.com",
@@ -13,50 +12,36 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).end("Method Not Allowed");
 
-  // --- Stripe initialisieren (fixe API-Version!) ---
   const stripeSecret = process.env.STRIPE_SECRET_KEY;
   if (!stripeSecret) return res.status(500).json({ error: "Missing STRIPE_SECRET_KEY" });
-
-  const { default: Stripe } = await import("stripe");
-  const stripe = new Stripe(stripeSecret, { apiVersion: "2024-06-20" });
+  const stripe = (await import("stripe")).default(stripeSecret);
 
   try {
-    // --- Request-Body lesen ---
     const { plan = "one_time", email = "", name = "", phone = "", thankYouUrl } = await readJson(req);
 
-    // --- Price-IDs aus Env ---
     const PRICE_ONE_TIME = process.env.PRICE_ONE_TIME;
     const PRICE_SPLIT_2  = process.env.PRICE_SPLIT_2;
     const PRICE_SPLIT_3  = process.env.PRICE_SPLIT_3;
 
-    // --- Mapping: Frontend-Keys -> Stripe Prices ---
-    const priceMap = {
-      one_time:      PRICE_ONE_TIME,
-      split_2:       PRICE_SPLIT_2,
-      split_3:       PRICE_SPLIT_3,
-      aibe_pif:      PRICE_ONE_TIME,
-      aibe_split_2:  PRICE_SPLIT_2,
-      aibe_split_3:  PRICE_SPLIT_3,
+    const map = {
+      // alte Keys
+      one_time:     PRICE_ONE_TIME,
+      split_2:      PRICE_SPLIT_2,
+      split_3:      PRICE_SPLIT_3,
+      // Frontend Keys
+      aibe_pif:     PRICE_ONE_TIME,
+      aibe_split_2: PRICE_SPLIT_2,
+      aibe_split_3: PRICE_SPLIT_3,
     };
+    const totals = { one_time: 499, split_2: 515, split_3: 525, aibe_pif: 499, aibe_split_2: 515, aibe_split_3: 525 };
 
-    // --- Totals für Return-URL (auch für aibe_* befüllen) ---
-    const totalMap = {
-      one_time:      499,
-      split_2:       515,
-      split_3:       525,
-      aibe_pif:      499,
-      aibe_split_2:  515,
-      aibe_split_3:  525,
-    };
-
-    const price = priceMap[plan];
+    const price = map[plan];
     if (!price) return res.status(400).json({ error: "Unknown plan" });
 
-    // --- Modus bestimmen (payment vs subscription) ---
-    const subscriptionPlans = new Set(["split_2", "aibe_split_2", "split_3", "aibe_split_3"]);
+    const subscriptionPlans = new Set(["split_2","aibe_split_2","split_3","aibe_split_3"]);
     const mode = subscriptionPlans.has(plan) ? "subscription" : "payment";
 
-    // --- Optional: Customer für Prefill/Phone ---
+    // Optional: Customer für Prefill / Wiederkehrer
     let customerId;
     if (email) {
       const found = await stripe.customers.list({ email, limit: 1 });
@@ -67,69 +52,54 @@ export default async function handler(req, res) {
         if (phone && !found.data[0].phone) update.phone = phone;
         if (Object.keys(update).length) await stripe.customers.update(customerId, update);
       } else {
-        const created = await stripe.customers.create({ email, name, phone });
-        customerId = created.id;
+        customerId = (await stripe.customers.create({ email, name, phone })).id;
       }
     }
 
-    // --- Gemeinsame Checkout-Optionen ---
-    const baseSession = {
+    const session = await stripe.checkout.sessions.create({
       ui_mode: "embedded",
       mode,
       customer: customerId || undefined,
       customer_email: customerId ? undefined : (email || undefined),
+
       line_items: [{ price, quantity: 1 }],
 
-      // 🧾 Rechnungs-/Steuerdaten + optionale Felder (Company / USt-ID)
+      // ✅ Adresse verpflichtend einsammeln (Rechnungsadresse)
       billing_address_collection: "required",
+
+      // ✅ Rechnung automatisch erzeugen (mit den Adressdaten)
       invoice_creation: { enabled: true },
-      automatic_tax: { enabled: true },
+
+      // ✅ USt-Id & Telefon einsammeln (optional – ausblenden: entferne diese Blöcke)
       tax_id_collection: { enabled: true },
+      phone_number_collection: { enabled: true },
+
+      // Optional: Firmenname als eigenes Feld (hier OPTIONAL – auf Pflicht ändern: optional:false)
       custom_fields: [
         {
           key: "company_name",
-          label: { type: "custom", custom: "Firmenname (optional)" },
-          type: "text",
-          optional: true
-        },
-        {
-          key: "vat_number",
-          label: { type: "custom", custom: "Umsatzsteuer-ID (optional)" },
+          label: { type: "custom", custom: "Firmenname" },
           type: "text",
           optional: true
         }
       ],
 
-      // Zurück zur Thanks-Page
-      return_url: `${thankYouUrl || "https://ai-business-engine.com/thank-you"}?plan=${encodeURIComponent(plan)}&total=${totalMap[plan]}&session_id={CHECKOUT_SESSION_ID}`
-    };
+      // sorgt dafür, dass Stripe bei Bedarf einen Customer anlegt
+      customer_creation: "if_required",
 
-    // --- Receipts sicherstellen ---
-    // Für Einmalzahlung: PaymentIntent-Receipt-Mail explizit setzen.
-    // Für Subscription: Receipt kommt über Billing-Einstellungen (Settings → Emails/Billing)
-    if (mode === "payment") {
-      baseSession.payment_intent_data = {
-        // E-Mail für die Quittung explizit setzen
-        receipt_email: email || undefined,
+      // Metadaten (damit du im Dashboard alles siehst)
+      payment_intent_data: {
         metadata: {
-          first_name: name || "",
-          phone: phone || "",
-          plan: plan || ""
+          plan,
+          form_email: email || "",
+          form_name:  name  || "",
+          form_phone: phone || ""
         }
-      };
-    } else {
-      // Metadaten bei Subscriptions übergeben (optional)
-      baseSession.subscription_data = {
-        metadata: {
-          first_name: name || "",
-          phone: phone || "",
-          plan: plan || ""
-        }
-      };
-    }
+      },
 
-    // --- Checkout Session erstellen (Embedded) ---
-    const session = await stripe.checkout.sessions.create(baseSession);
+      // Stripe-Rückkehr (wir hängen plan/total für deine TY-Logik an)
+      return_url: `${thankYouUrl || "https://ai-business-engine.com/thank-you"}?plan=${encodeURIComponent(plan)}&total=${totals[plan] || ""}&session_id={CHECKOUT_SESSION_ID}`
+    });
 
     return res.status(200).json({ client_secret: session.client_secret });
   } catch (e) {
@@ -138,10 +108,8 @@ export default async function handler(req, res) {
   }
 }
 
-// --- Hilfsfunktion ---
 async function readJson(req) {
-  const chunks = [];
-  for await (const x of req) chunks.push(x);
-  const raw = Buffer.concat(chunks).toString("utf8") || "{}";
-  return JSON.parse(raw);
+  const c = [];
+  for await (const x of req) c.push(x);
+  return JSON.parse(Buffer.concat(c).toString("utf8") || "{}");
 }
