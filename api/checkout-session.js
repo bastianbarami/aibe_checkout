@@ -24,42 +24,38 @@ export default async function handler(req, res) {
     const PRICE_SPLIT_3  = process.env.PRICE_SPLIT_3;
 
     const map = {
+      // alte Keys
       one_time: PRICE_ONE_TIME,
-      split_2: PRICE_SPLIT_2,
-      split_3: PRICE_SPLIT_3,
-      aibe_pif: PRICE_ONE_TIME,
-      aibe_split_2: PRICE_SPLIT_2,
-      aibe_split_3: PRICE_SPLIT_3,
+      split_2:  PRICE_SPLIT_2,
+      split_3:  PRICE_SPLIT_3,
+      // Frontend Keys
+      aibe_pif:      PRICE_ONE_TIME,
+      aibe_split_2:  PRICE_SPLIT_2,
+      aibe_split_3:  PRICE_SPLIT_3,
     };
-
     const totals = { aibe_pif: 499, aibe_split_2: 515, aibe_split_3: 525 };
+
     const price = map[plan];
     if (!price) return res.status(400).json({ error: "Unknown plan" });
 
-    const isSub = ["split_2","aibe_split_2","split_3","aibe_split_3"].includes(plan);
-    const mode = isSub ? "subscription" : "payment";
+    const isSub = ["split_2", "aibe_split_2", "split_3", "aibe_split_3"].includes(plan);
+    const mode  = isSub ? "subscription" : "payment";
 
-    // ❌ Kundenwiederverwendung entfernen, damit Stripe IMMER alle Felder zeigt
+    // Embedded Checkout: KEIN success_url/cancel_url — NUR return_url
     const session = await stripe.checkout.sessions.create({
       ui_mode: "embedded",
       mode,
       line_items: [{ price, quantity: 1 }],
-      success_url: thankYouUrl || "https://ai-business-engine.com/thank-you",
-      cancel_url: "https://ai-business-engine.com",
 
-      // 🧾 Rechnungsadresse verpflichtend anzeigen
+      // zurück auf deine TY-Seite
+      return_url: `${thankYouUrl || "https://ai-business-engine.com/thank-you"}?plan=${encodeURIComponent(plan)}&total=${totals[plan] || ""}&session_id={CHECKOUT_SESSION_ID}`,
+
+      // Rechnungs-/Steuer-Felder
       billing_address_collection: "required",
-
-      // 🧾 Automatische Rechnung aktivieren
-      invoice_creation: { enabled: true },
-
-      // 🧾 Umsatzsteuer-ID optional anzeigen
       tax_id_collection: { enabled: true },
-
-      // 🚫 KEINE Telefonnummer
       phone_number_collection: { enabled: false },
 
-      // 🧱 Firmenname optional
+      // Firmenname (optional)
       custom_fields: [
         {
           key: "company_name",
@@ -69,19 +65,24 @@ export default async function handler(req, res) {
         }
       ],
 
-      // ⚙️ Stripe soll Customer automatisch erstellen
+      // Kunde wird erst bei Bedarf erstellt; Felder werden angezeigt
       customer_creation: "if_required",
 
-      // 💬 Metadaten
+      // Prefill, falls du E-Mail/Name aus deinem Formular mitgibst
+      customer_email: email || undefined,
+      customer_update: { address: "auto" },
+
+      // Rechnung automatisch erzeugen
+      invoice_creation: { enabled: true },
+
+      // nützliche Metadaten
       payment_intent_data: {
         metadata: {
           plan,
-          form_email: email,
-          form_name: name
+          form_email: email || "",
+          form_name:  name  || ""
         }
-      },
-
-      return_url: `${thankYouUrl || "https://ai-business-engine.com/thank-you"}?plan=${encodeURIComponent(plan)}&total=${totals[plan] || ""}&session_id={CHECKOUT_SESSION_ID}`
+      }
     });
 
     return res.status(200).json({ client_secret: session.client_secret });
@@ -91,8 +92,7 @@ export default async function handler(req, res) {
   }
 }
 
-async function readJson(req) {
-  const c = [];
-  for await (const x of req) c.push(x);
+async function readJson(req){
+  const c=[]; for await (const x of req) c.push(x);
   return JSON.parse(Buffer.concat(c).toString("utf8") || "{}");
 }
