@@ -17,64 +17,49 @@ export default async function handler(req, res) {
   const stripe = (await import("stripe")).default(stripeSecret);
 
   try {
-    const { plan = "one_time", email = "", name = "", phone = "", thankYouUrl } = await readJson(req);
+    const { plan = "one_time", email = "", name = "", thankYouUrl } = await readJson(req);
 
     const PRICE_ONE_TIME = process.env.PRICE_ONE_TIME;
     const PRICE_SPLIT_2  = process.env.PRICE_SPLIT_2;
     const PRICE_SPLIT_3  = process.env.PRICE_SPLIT_3;
 
     const map = {
-      // alte Keys
-      one_time:     PRICE_ONE_TIME,
-      split_2:      PRICE_SPLIT_2,
-      split_3:      PRICE_SPLIT_3,
-      // Frontend Keys
-      aibe_pif:     PRICE_ONE_TIME,
+      one_time: PRICE_ONE_TIME,
+      split_2: PRICE_SPLIT_2,
+      split_3: PRICE_SPLIT_3,
+      aibe_pif: PRICE_ONE_TIME,
       aibe_split_2: PRICE_SPLIT_2,
       aibe_split_3: PRICE_SPLIT_3,
     };
-    const totals = { one_time: 499, split_2: 515, split_3: 525, aibe_pif: 499, aibe_split_2: 515, aibe_split_3: 525 };
 
+    const totals = { aibe_pif: 499, aibe_split_2: 515, aibe_split_3: 525 };
     const price = map[plan];
     if (!price) return res.status(400).json({ error: "Unknown plan" });
 
-    const subscriptionPlans = new Set(["split_2","aibe_split_2","split_3","aibe_split_3"]);
-    const mode = subscriptionPlans.has(plan) ? "subscription" : "payment";
+    const isSub = ["split_2","aibe_split_2","split_3","aibe_split_3"].includes(plan);
+    const mode = isSub ? "subscription" : "payment";
 
-    // Optional: Customer für Prefill / Wiederkehrer
-    let customerId;
-    if (email) {
-      const found = await stripe.customers.list({ email, limit: 1 });
-      if (found.data.length) {
-        customerId = found.data[0].id;
-        const update = {};
-        if (name  && !found.data[0].name)  update.name  = name;
-        if (phone && !found.data[0].phone) update.phone = phone;
-        if (Object.keys(update).length) await stripe.customers.update(customerId, update);
-      } else {
-        customerId = (await stripe.customers.create({ email, name, phone })).id;
-      }
-    }
-
+    // ❌ Kundenwiederverwendung entfernen, damit Stripe IMMER alle Felder zeigt
     const session = await stripe.checkout.sessions.create({
       ui_mode: "embedded",
       mode,
-      customer: customerId || undefined,
-      customer_email: customerId ? undefined : (email || undefined),
-
       line_items: [{ price, quantity: 1 }],
+      success_url: thankYouUrl || "https://ai-business-engine.com/thank-you",
+      cancel_url: "https://ai-business-engine.com",
 
-      // ✅ Adresse verpflichtend einsammeln (Rechnungsadresse)
+      // 🧾 Rechnungsadresse verpflichtend anzeigen
       billing_address_collection: "required",
 
-      // ✅ Rechnung automatisch erzeugen (mit den Adressdaten)
+      // 🧾 Automatische Rechnung aktivieren
       invoice_creation: { enabled: true },
 
-      // ✅ USt-Id & Telefon einsammeln (optional – ausblenden: entferne diese Blöcke)
+      // 🧾 Umsatzsteuer-ID optional anzeigen
       tax_id_collection: { enabled: true },
-      phone_number_collection: { enabled: true },
 
-      // Optional: Firmenname als eigenes Feld (hier OPTIONAL – auf Pflicht ändern: optional:false)
+      // 🚫 KEINE Telefonnummer
+      phone_number_collection: { enabled: false },
+
+      // 🧱 Firmenname optional
       custom_fields: [
         {
           key: "company_name",
@@ -84,20 +69,18 @@ export default async function handler(req, res) {
         }
       ],
 
-      // sorgt dafür, dass Stripe bei Bedarf einen Customer anlegt
+      // ⚙️ Stripe soll Customer automatisch erstellen
       customer_creation: "if_required",
 
-      // Metadaten (damit du im Dashboard alles siehst)
+      // 💬 Metadaten
       payment_intent_data: {
         metadata: {
           plan,
-          form_email: email || "",
-          form_name:  name  || "",
-          form_phone: phone || ""
+          form_email: email,
+          form_name: name
         }
       },
 
-      // Stripe-Rückkehr (wir hängen plan/total für deine TY-Logik an)
       return_url: `${thankYouUrl || "https://ai-business-engine.com/thank-you"}?plan=${encodeURIComponent(plan)}&total=${totals[plan] || ""}&session_id={CHECKOUT_SESSION_ID}`
     });
 
