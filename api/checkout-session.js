@@ -19,38 +19,36 @@ export default async function handler(req, res) {
   try {
     const { plan = "one_time", email = "", name = "", thankYouUrl } = await readJson(req);
 
+    // Preis-IDs aus Stripe
     const PRICE_ONE_TIME = process.env.PRICE_ONE_TIME;
     const PRICE_SPLIT_2  = process.env.PRICE_SPLIT_2;
     const PRICE_SPLIT_3  = process.env.PRICE_SPLIT_3;
 
     const map = {
-      // alte Keys
       one_time: PRICE_ONE_TIME,
       split_2:  PRICE_SPLIT_2,
       split_3:  PRICE_SPLIT_3,
-      // Frontend Keys
-      aibe_pif:      PRICE_ONE_TIME,
-      aibe_split_2:  PRICE_SPLIT_2,
-      aibe_split_3:  PRICE_SPLIT_3,
+      aibe_pif: PRICE_ONE_TIME,
+      aibe_split_2: PRICE_SPLIT_2,
+      aibe_split_3: PRICE_SPLIT_3,
     };
     const totals = { aibe_pif: 499, aibe_split_2: 515, aibe_split_3: 525 };
-
     const price = map[plan];
     if (!price) return res.status(400).json({ error: "Unknown plan" });
 
     const isSub = ["split_2", "aibe_split_2", "split_3", "aibe_split_3"].includes(plan);
     const mode  = isSub ? "subscription" : "payment";
 
-    // Embedded Checkout: KEIN success_url/cancel_url — NUR return_url
+    // ✅ Embedded Checkout Session korrekt erstellt
     const session = await stripe.checkout.sessions.create({
       ui_mode: "embedded",
       mode,
       line_items: [{ price, quantity: 1 }],
 
-      // zurück auf deine TY-Seite
+      // Rückleitungs-URL nach erfolgreicher Zahlung
       return_url: `${thankYouUrl || "https://ai-business-engine.com/thank-you"}?plan=${encodeURIComponent(plan)}&total=${totals[plan] || ""}&session_id={CHECKOUT_SESSION_ID}`,
 
-      // Rechnungs-/Steuer-Felder
+      // Rechnungsdaten – Pflichtfelder aktivieren
       billing_address_collection: "required",
       tax_id_collection: { enabled: true },
       phone_number_collection: { enabled: false },
@@ -65,17 +63,13 @@ export default async function handler(req, res) {
         }
       ],
 
-      // Kunde wird erst bei Bedarf erstellt; Felder werden angezeigt
-      customer_creation: "if_required",
-
-      // Prefill, falls du E-Mail/Name aus deinem Formular mitgibst
-      customer_email: email || undefined,
-      customer_update: { address: "auto" },
-
-      // Rechnung automatisch erzeugen
+      // Rechnung automatisch aktivieren
       invoice_creation: { enabled: true },
 
-      // nützliche Metadaten
+      // Prefill – E-Mail (und optional Name)
+      customer_email: email || undefined,
+
+      // Metadaten zur späteren Nachverfolgung
       payment_intent_data: {
         metadata: {
           plan,
@@ -92,7 +86,9 @@ export default async function handler(req, res) {
   }
 }
 
-async function readJson(req){
-  const c=[]; for await (const x of req) c.push(x);
+// JSON Parser
+async function readJson(req) {
+  const c = [];
+  for await (const x of req) c.push(x);
   return JSON.parse(Buffer.concat(c).toString("utf8") || "{}");
 }
