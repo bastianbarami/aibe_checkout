@@ -2,10 +2,9 @@
   "name": "aibe-checkout",
   "version": "1.0.0",
   "private": true,
-  "license": "UNLICENSED",
-  "type": "commonjs",
+  "type": "module",
   "engines": {
-    "node": ">=18.17"
+    "node": "18.x"
   },
   "dependencies": {
     "stripe": "^14.0.0"
