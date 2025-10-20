@@ -19,8 +19,7 @@ export default async function handler(req, res) {
   if (!stripeSecret) return res.status(500).json({ error: "Missing STRIPE_SECRET_KEY" });
 
   // Stripe SDK dynamisch importieren (Node Runtime)
-  import Stripe from "stripe";
-const stripe = new Stripe(stripeSecret);
+const stripe = (await import("stripe")).default(stripeSecret);
 
   try {
     const { plan = "one_time", email = "", name = "", thankYouUrl } = await readJson(req);
