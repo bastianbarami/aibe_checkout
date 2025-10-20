@@ -77,13 +77,13 @@ const stripe = (await import("stripe")).default(stripeSecret);
       custom_fields: [
         {
           key: "company_name",
-          label: { type: "custom", custom: "Firmenname (optional)" },
+          label: { type: "custom", custom: "Firmenname" },
           type: "text",
           optional: true,
         },
         {
           key: "tax_number",
-          label: { type: "custom", custom: "Steuernummer / VAT (optional)" },
+          label: { type: "custom", custom: "Deine (Umsatz-)Steuernummer" },
           type: "text",
           optional: true,
         },
