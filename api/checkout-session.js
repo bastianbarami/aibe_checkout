@@ -25,11 +25,9 @@ export default async function handler(req, res) {
     const PRICE_SPLIT_3  = process.env.PRICE_SPLIT_3;
 
     const map = {
-      // alte Keys
       one_time: PRICE_ONE_TIME,
       split_2:  PRICE_SPLIT_2,
       split_3:  PRICE_SPLIT_3,
-      // Frontend Keys
       aibe_pif: PRICE_ONE_TIME,
       aibe_split_2: PRICE_SPLIT_2,
       aibe_split_3: PRICE_SPLIT_3,
@@ -42,13 +40,12 @@ export default async function handler(req, res) {
     const isSub = ["split_2","aibe_split_2","split_3","aibe_split_3"].includes(plan);
     const mode  = isSub ? "subscription" : "payment";
 
-    // ✅ Customer erstellen/holen (für Prefill von Name/Email)
+    // ✔ Customer vorbereiten (für Prefill & spätere Rechnungsdaten)
     let customerId;
     if (email) {
       const found = await stripe.customers.list({ email, limit: 1 });
       if (found.data.length) {
         customerId = found.data[0].id;
-        // Name ggf. ergänzen, wenn noch leer
         if (name && !found.data[0].name) {
           await stripe.customers.update(customerId, { name });
         }
@@ -58,60 +55,58 @@ export default async function handler(req, res) {
       }
     }
 
-    // Gemeinsame Session-Optionen
-    const sessionBase = {
+    // ✅ Embedded Checkout Session:
+    // - OHNE tax_id_collection (damit der Business-Schalter verschwindet)
+    // - ZWEI optionale Custom-Felder: company_name & tax_number
+    const session = await stripe.checkout.sessions.create({
       ui_mode: "embedded",
       mode,
       line_items: [{ price, quantity: 1 }],
 
-      // Nach erfolgreicher Zahlung zurück zur Thank-You-Page
-      return_url:
-        `${thankYouUrl || "https://ai-business-engine.com/thank-you"}?plan=${encodeURIComponent(plan)}&total=${totals[plan] || ""}&session_id={CHECKOUT_SESSION_ID}`,
+      // nach Erfolg zurück
+      return_url: `${thankYouUrl || "https://ai-business-engine.com/thank-you"}?plan=${encodeURIComponent(plan)}&total=${totals[plan] || ""}&session_id={CHECKOUT_SESSION_ID}`,
 
-      // Rechnungsdaten: Adresse Pflicht, USt-ID optional; Telefon aus
+      // Adresse weiterhin erforderlich
       billing_address_collection: "required",
-      tax_id_collection: { enabled: true },  // nur Sammlung, keine Steuerberechnung
-      // wichtig: keine automatische Steuerberechnung einschalten
-      automatic_tax: { enabled: false },
-      phone_number_collection: { enabled: false },
 
-      // (Optional) Firmenname als freies Freitextfeld
+      // ❌ VAT/Tax-ID Sammlung von Stripe deaktiviert -> kein "als Business kaufen"
+      tax_id_collection: { enabled: false },
+
+      // ➕ Deine zwei optionalen Felder
       custom_fields: [
         {
           key: "company_name",
-          label: { type: "custom", custom: "Firmenname" },
+          label: { type: "custom", custom: "Firmenname (optional)" },
+          type: "text",
+          optional: true
+        },
+        {
+          key: "tax_number",
+          label: { type: "custom", custom: "Steuernummer / VAT (optional)" },
           type: "text",
           optional: true
         }
       ],
 
-      // Customer für Prefill
+      // Keine automatische Rechnung für One-Time (bei Subscriptions erstellt Stripe ohnehin eine)
+      // invoice_creation: { enabled: false },
+
+      // Customer setzen/erstellen
       customer: customerId || undefined,
-      // Falls kein Customer existiert, wenigstens die Email prefillen:
       customer_email: customerId ? undefined : (email || undefined),
 
-      // 🔑 WICHTIG: erlaubt dem Checkout, Name/Adresse
-      // am bestehenden Customer zu aktualisieren → nötig für tax_id_collection
-      customer_update: customerId ? { name: "auto", address: "auto" } : undefined,
-    };
+      // Meta fürs Dashboard/Tracking
+      payment_intent_data: {
+        metadata: {
+          plan,
+          form_email: email || "",
+          form_name:  name  || ""
+        }
+      },
 
-    // Metadaten korrekt je nach Modus setzen
-    if (mode === "payment") {
-      sessionBase.payment_intent_data = {
-        metadata: { plan, form_email: email || "", form_name: name || "" }
-      };
-    } else {
-      // subscription
-      sessionBase.subscription_data = {
-        metadata: { plan, form_email: email || "", form_name: name || "" }
-      };
-    }
-
-    // ⚠️ KEIN invoice_creation hier, damit keine Rechnung automatisch verschickt wird
-    // invoice_creation: { enabled: false }, // absichtlich weggelassen
-
-    // Session erstellen
-    const session = await stripe.checkout.sessions.create(sessionBase);
+      // optional nützlich: Customer immer anlegen (falls keiner vorhanden)
+      customer_creation: "always",
+    });
 
     return res.status(200).json({ client_secret: session.client_secret });
   } catch (e) {
