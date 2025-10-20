@@ -66,6 +66,9 @@ export default async function handler(req, res) {
       tax_id_collection: { enabled: false },
       phone_number_collection: { enabled: false },
 
+      // ⬇️ Ergänzung: Name & Adresse des Customers automatisch aus Checkout übernehmen
+      customer_update: { name: "auto", address: "auto" },
+
       custom_fields: [
         {
           key: "company_name",
