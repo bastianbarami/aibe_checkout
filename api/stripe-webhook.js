@@ -40,25 +40,18 @@ export default async function handler(req, res) {
         if (!customerId) break;
 
         // -------- Custom-Felder aus der Checkout-Session lesen --------
-        // erwartete Keys aus dem Embedded Checkout:
-        // - company_name
-        // - company_tax_number (Fallback: tax_id)
         const findTextField = (key) => {
           const f = (session.custom_fields || []).find((x) => x.key === key);
-          // Stripe liefert bei text-Feldern .text.value
           return f?.text?.value || null;
         };
-
         const companyName =
-          findTextField("company_name") /* bevorzugt */ || null;
-
+          findTextField("company_name") || null; // Firmenname aus optionalem Feld
         const taxNumber =
           findTextField("company_tax_number") ||
-          findTextField("tax_id") || // Fallback, falls ältere Form
+          findTextField("tax_id") ||
           null;
 
-        // -------- Update-Objekt für den Customer vorbereiten --------
-        // Falls Firmenname vorhanden: Name des Customers auf Firmenname setzen.
+        // -------- Customer vorbereiten & aktualisieren --------
         const update = {
           metadata: {
             ...(companyName ? { company_name: companyName } : {}),
@@ -66,7 +59,7 @@ export default async function handler(req, res) {
           },
         };
 
-        // Sichtbar im PDF am Fuß der Rechnung
+        // Sichtbar im PDF als Zeilen am Fuß
         const customFields = [];
         if (companyName) customFields.push({ name: "Firma", value: companyName });
         if (taxNumber) customFields.push({ name: "USt-/VAT", value: taxNumber });
@@ -79,7 +72,6 @@ export default async function handler(req, res) {
           update.name = companyName;
         }
 
-        // Nur updaten, wenn wir wirklich etwas setzen
         if (
           update.name ||
           (update.invoice_settings && update.invoice_settings.custom_fields?.length) ||
@@ -89,44 +81,81 @@ export default async function handler(req, res) {
           console.log("✅ Customer updated:", customerId, update);
         }
 
+        // -------- Falls Sub: Rechnung direkt nachziehen (Name & Felder) --------
+        if (session.mode === "subscription" && companyName) {
+          try {
+            // Neueste Rechnung der Sub beziehen
+            const sub = await stripe.subscriptions.retrieve(session.subscription, {
+              expand: ["latest_invoice"],
+            });
+            const latest = sub.latest_invoice;
+            const invoiceId =
+              typeof latest === "string" ? latest : latest?.id || null;
+
+            if (invoiceId) {
+              const invUpdate = {
+                customer_name: companyName, // Kopfzeile der Rechnung überschreiben
+              };
+
+              // Falls wir hier sicherstellen wollen, dass die Fuß-Fields schon auf der Rechnung landen:
+              if (customFields.length) {
+                invUpdate.custom_fields = customFields;
+              }
+
+              await stripe.invoices.update(invoiceId, invUpdate);
+              console.log("🧾 Invoice updated from session:", invoiceId, invUpdate);
+            }
+          } catch (e) {
+            console.warn("Invoice immediate update from session failed:", e.message);
+          }
+        }
+
         break;
       }
 
-      // 2) Sicherheitsnetz: Falls erste Rechnung schon erstellt/finalized ist,
-      //    bevor wir den Customer updaten konnten, schreiben wir die Felder
-      //    direkt in die Rechnung (Custom Fields sichtbar im PDF).
+      // 2) Fallback/Sicherheitsnetz: Falls Rechnung bereits finalisiert,
+      //    überschreiben wir zusätzlich den sichtbaren customer_name
+      //    und hängen Custom Fields an, falls am Customer vorhanden.
       case "invoice.finalized": {
         const invoice = event.data.object;
 
-        // Wenn es bereits Custom Fields auf der Rechnung gibt: nichts tun
-        if (invoice.custom_fields?.length) break;
+        if (!invoice.customer) break;
 
-        if (invoice.customer) {
-          const cust = await stripe.customers.retrieve(invoice.customer);
+        const cust = await stripe.customers.retrieve(invoice.customer);
 
-          // Falls der Customer schon Custom Fields trägt, übernehme sie in die Rechnung
-          const cf = cust?.invoice_settings?.custom_fields || [];
+        const companyName =
+          cust?.metadata?.company_name || // bevorzugt aus Metadata
+          cust?.name ||                   // oder bereits zugewiesener Name
+          null;
 
-          // BONUS: Wenn wir Metadaten haben, aber noch keine Custom Fields,
-          // bauen wir sie hier (sofern sinnvoll) dennoch zusammen.
-          if (!cf.length) {
-            const maybeCompany = cust?.metadata?.company_name || null;
-            const maybeVat = cust?.metadata?.vat_or_tax_id || null;
-            const derived = [];
-            if (maybeCompany) derived.push({ name: "Firma", value: maybeCompany });
-            if (maybeVat) derived.push({ name: "USt-/VAT", value: maybeVat });
-            if (derived.length) {
-              cf.push(...derived);
-            }
-          }
+        const cf =
+          cust?.invoice_settings?.custom_fields && cust.invoice_settings.custom_fields.length
+            ? cust.invoice_settings.custom_fields
+            : (() => {
+                // aus Metadata ableiten, falls keine Custom Fields vorhanden
+                const derived = [];
+                if (cust?.metadata?.company_name)
+                  derived.push({ name: "Firma", value: cust.metadata.company_name });
+                if (cust?.metadata?.vat_or_tax_id)
+                  derived.push({ name: "USt-/VAT", value: cust.metadata.vat_or_tax_id });
+                return derived;
+              })();
 
-          if (cf.length) {
-            await stripe.invoices.update(invoice.id, {
-              custom_fields: cf,
-            });
-            console.log("🧾 Invoice custom_fields set via webhook:", invoice.id, cf);
-          }
+        const invUpdate = {};
+        // Nur setzen, wenn wir wirklich einen Firmennamen haben und er auf der Rechnung
+        // (noch) nicht steht
+        if (companyName && invoice.customer_name !== companyName) {
+          invUpdate.customer_name = companyName;
         }
+        if (cf?.length && !(invoice.custom_fields?.length)) {
+          invUpdate.custom_fields = cf;
+        }
+
+        if (Object.keys(invUpdate).length) {
+          await stripe.invoices.update(invoice.id, invUpdate);
+          console.log("🧾 Invoice updated on finalized:", invoice.id, invUpdate);
+        }
+
         break;
       }
 
