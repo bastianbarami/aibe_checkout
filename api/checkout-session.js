@@ -26,8 +26,8 @@ export default async function handler(req, res) {
 
     const map = {
       one_time: PRICE_ONE_TIME,
-      split_2: PRICE_SPLIT_2,
-      split_3: PRICE_SPLIT_3,
+      split_2:  PRICE_SPLIT_2,
+      split_3:  PRICE_SPLIT_3,
       aibe_pif: PRICE_ONE_TIME,
       aibe_split_2: PRICE_SPLIT_2,
       aibe_split_3: PRICE_SPLIT_3,
@@ -66,9 +66,6 @@ export default async function handler(req, res) {
       tax_id_collection: { enabled: false },
       phone_number_collection: { enabled: false },
 
-      // ⬇️ Ergänzung: Name & Adresse des Customers automatisch aus Checkout übernehmen
-      customer_update: { name: "auto", address: "auto" },
-
       custom_fields: [
         {
           key: "company_name",
@@ -88,14 +85,30 @@ export default async function handler(req, res) {
       customer_email: customerId ? undefined : (email || undefined),
     };
 
-    // 🔹 Metadaten dynamisch je nach Modus
+    // 🔹 Metadaten + (NEU) Rechnung für Einmalzahlungen
     if (mode === "payment") {
       // Nur bei Einmalzahlung erlaubt
       sessionParams.payment_intent_data = {
         metadata: {
           plan,
           form_email: email || "",
-          form_name: name || ""
+          form_name:  name  || ""
+        }
+      };
+
+      // ✅ NEU: Auch bei Einmalzahlungen eine Rechnung erzeugen
+      sessionParams.invoice_creation = {
+        enabled: true,
+        invoice_data: {
+          footer:
+            "Reverse Charge – Die Steuerschuldnerschaft liegt beim Leistungsempfänger.",
+          metadata: {
+            plan,
+            form_email: email || "",
+            form_name:  name  || ""
+          }
+          // Custom Fields (Firma/VAT) setzt dein Webhook zuverlässig,
+          // sobald die Rechnung erstellt/finalized wird.
         }
       };
     } else {
@@ -104,7 +117,7 @@ export default async function handler(req, res) {
         metadata: {
           plan,
           form_email: email || "",
-          form_name: name || ""
+          form_name:  name  || ""
         }
       };
     }
