@@ -1,9 +1,10 @@
 // api/checkout-session.js
 export default async function handler(req, res) {
+  // --- CORS / Method guard ---
   const ALLOWED = [
     "https://ai-business-engine.com",
     "https://www.ai-business-engine.com",
-    "https://baramiai-c98bd4c508b71b1b1c91ae95c029fc.webflow.io"
+    "https://baramiai-c98bd4c508b71b1b1c91ae95c029fc.webflow.io",
   ];
   const origin = req.headers.origin || "";
   if (ALLOWED.includes(origin)) res.setHeader("Access-Control-Allow-Origin", origin);
@@ -12,6 +13,7 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).end("Method Not Allowed");
 
+  // --- Stripe init ---
   const stripeSecret = process.env.STRIPE_SECRET_KEY;
   if (!stripeSecret) return res.status(500).json({ error: "Missing STRIPE_SECRET_KEY" });
   const stripe = (await import("stripe")).default(stripeSecret);
@@ -19,7 +21,7 @@ export default async function handler(req, res) {
   try {
     const { plan = "one_time", email = "", name = "", thankYouUrl } = await readJson(req);
 
-    // Preis-IDs aus Environment
+    // --- Prices from env ---
     const PRICE_ONE_TIME = process.env.PRICE_ONE_TIME;
     const PRICE_SPLIT_2  = process.env.PRICE_SPLIT_2;
     const PRICE_SPLIT_3  = process.env.PRICE_SPLIT_3;
@@ -38,9 +40,9 @@ export default async function handler(req, res) {
     if (!price) return res.status(400).json({ error: "Unknown plan" });
 
     const isSub = ["split_2", "aibe_split_2", "split_3", "aibe_split_3"].includes(plan);
-    const mode = isSub ? "subscription" : "payment";
+    const mode  = isSub ? "subscription" : "payment";
 
-    // 🔹 Customer erstellen oder holen
+    // --- Create or find Customer (prefill email/name) ---
     let customerId;
     if (email) {
       const found = await stripe.customers.list({ email, limit: 1 });
@@ -55,48 +57,54 @@ export default async function handler(req, res) {
       }
     }
 
-    // 🔹 Gemeinsame Session-Parameter
+    // --- Base session params ---
     const sessionParams = {
       ui_mode: "embedded",
       mode,
       line_items: [{ price, quantity: 1 }],
       return_url: `${thankYouUrl || "https://ai-business-engine.com/thank-you"}?plan=${encodeURIComponent(plan)}&total=${totals[plan] || ""}&session_id={CHECKOUT_SESSION_ID}`,
 
+      // Prefill / association
+      customer: customerId || undefined,
+      customer_email: customerId ? undefined : (email || undefined),
+
+      // ✅ allow updating name/address for existing customers (prevents tax-id/name errors)
+      customer_update: { name: "auto", address: "auto" },
+
+      // Checkout fields
       billing_address_collection: "required",
       tax_id_collection: { enabled: false },
       phone_number_collection: { enabled: false },
 
+      // Custom optional fields shown in Checkout (read later by the webhook)
       custom_fields: [
         {
           key: "company_name",
           label: { type: "custom", custom: "Firmenname (optional)" },
           type: "text",
-          optional: true
+          optional: true,
         },
         {
           key: "company_tax_number",
           label: { type: "custom", custom: "Steuernummer / VAT (optional)" },
           type: "text",
-          optional: true
-        }
+          optional: true,
+        },
       ],
-
-      customer: customerId || undefined,
-      customer_email: customerId ? undefined : (email || undefined),
     };
 
-    // 🔹 Metadaten + (NEU) Rechnung für Einmalzahlungen
+    // --- Metadata + invoice behavior per mode ---
     if (mode === "payment") {
-      // Nur bei Einmalzahlung erlaubt
+      // one-time payment metadata
       sessionParams.payment_intent_data = {
         metadata: {
           plan,
           form_email: email || "",
-          form_name:  name  || ""
-        }
+          form_name:  name  || "",
+        },
       };
 
-      // ✅ NEU: Auch bei Einmalzahlungen eine Rechnung erzeugen
+      // create invoice for one-time payments as well
       sessionParams.invoice_creation = {
         enabled: true,
         invoice_data: {
@@ -105,24 +113,24 @@ export default async function handler(req, res) {
           metadata: {
             plan,
             form_email: email || "",
-            form_name:  name  || ""
-          }
-          // Custom Fields (Firma/VAT) setzt dein Webhook zuverlässig,
-          // sobald die Rechnung erstellt/finalized wird.
-        }
+            form_name:  name  || "",
+          },
+          // Company/VAT custom fields will be added by the webhook to the customer
+          // (and copied to the invoice if needed).
+        },
       };
     } else {
-      // Nur bei Subscription erlaubt
+      // subscription metadata
       sessionParams.subscription_data = {
         metadata: {
           plan,
           form_email: email || "",
-          form_name:  name  || ""
-        }
+          form_name:  name  || "",
+        },
       };
     }
 
-    // 🔹 Checkout-Session erstellen
+    // --- Create Checkout Session ---
     const session = await stripe.checkout.sessions.create(sessionParams);
     return res.status(200).json({ client_secret: session.client_secret });
   } catch (e) {
@@ -131,8 +139,9 @@ export default async function handler(req, res) {
   }
 }
 
+// --- utils ---
 async function readJson(req) {
-  const c = [];
-  for await (const x of req) c.push(x);
-  return JSON.parse(Buffer.concat(c).toString("utf8") || "{}");
+  const chunks = [];
+  for await (const x of req) chunks.push(x);
+  return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
 }
