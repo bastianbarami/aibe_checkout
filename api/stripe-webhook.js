@@ -1,10 +1,19 @@
 // api/stripe-webhook.js
+// ------------------------------------------------------------
+// Stripe Webhook-Handler (Vercel / Next.js API Route)
+// - bodyParser muss AUS sein (raw body für die Signaturprüfung)
+// - Setzt nach Checkout die gewünschten Felder am Customer:
+//     * invoice_settings.custom_fields => Firma + Steuernummer
+//     * Name-Logik: Wenn Firma angegeben, Customer-Name = Firmenname
+// - Fallback: Wenn zum Zeitpunkt der Rechnungs-Finalisierung (invoice.finalized)
+//   die Custom-Felder noch nicht auf der Rechnung sind, kopieren wir sie
+//   1:1 vom Customer auf die Rechnung.
+// ------------------------------------------------------------
 import { buffer } from "micro";
 
 export const config = {
   api: {
-    // Stripe braucht den "raw" Body für die Signaturprüfung
-    bodyParser: false,
+    bodyParser: false, // WICHTIG: Stripe verlangt den "raw" Body
   },
 };
 
@@ -22,7 +31,7 @@ export default async function handler(req, res) {
 
   const stripe = (await import("stripe")).default(stripeSecret);
 
-  // ---------- Signatur prüfen ----------
+  // ----- Stripe-Event verifizieren -----
   let event;
   try {
     const sig = req.headers["stripe-signature"];
@@ -33,102 +42,125 @@ export default async function handler(req, res) {
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
+  // Kleines Helper: Logging mit Event-Type
+  const log = (...args) => console.log(`[WH ${event?.type}]`, ...args);
+
   try {
     switch (event.type) {
-      // =========================================================
-      // A) Checkout beendet -> Kunde aktualisieren
-      // =========================================================
+      // =====================================================================
+      // 1) Nach abgeschlossenem Checkout: Customer aktualisieren
+      // =====================================================================
       case "checkout.session.completed": {
         const session = event.data.object;
-        console.log("[WH] checkout.session.completed:", {
-          id: session?.id,
-          customer: session?.customer,
-        });
-
         const customerId = session.customer;
-        if (!customerId) break;
 
-        // ---- Custom-Felder aus der Session lesen ----
-        const findTextField = (key) => {
+        log("session id:", session?.id, "customer:", customerId);
+
+        if (!customerId) {
+          log("No customer on session, skipping.");
+          break;
+        }
+
+        // Helper: Text aus Custom-Feld holen (aus der Checkout-Session).
+        // WICHTIG: Keys müssen mit denen aus der Checkout-Session übereinstimmen.
+        // (In deinem Checkout-Code: "company_name" und "company_tax_number")
+        const getTextField = (key) => {
           const f = (session.custom_fields || []).find((x) => x.key === key);
-          return f?.text?.value || null;
+          return f?.text?.value?.trim() || "";
         };
 
-        const companyName = findTextField("company_name");        // ✅ KORREKTER KEY
-        const taxNumber   = findTextField("company_tax_number");  // ✅ KORREKTER KEY
+        const companyName = getTextField("company_name");          // z.B. "KONKEL LLC"
+        const taxNumber   = getTextField("company_tax_number");    // z.B. "DE123456789"
 
-        // Stripe schreibt dank customer_update=name,address bereits Basisdaten.
-        // Wir ergänzen jetzt: Firmenlogik + Custom Fields + Metadata.
-        const customerUpdate = {
+        // Wir bauen die "Custom Fields", die auf der Rechnung unten angezeigt werden.
+        // (Labels frei wählbar – erscheinen exakt so auf der Rechnung)
+        const customFields = [];
+        if (companyName) customFields.push({ name: "Firma", value: companyName });
+        if (taxNumber)   customFields.push({ name: "Steuernummer / VAT", value: taxNumber });
+
+        // Update-Objekt für den Customer
+        const update = {
+          // Für die Buchhaltung zusätzlich in die Metadata schreiben
           metadata: {
             ...(companyName ? { company_name: companyName } : {}),
-            ...(taxNumber   ? { company_tax_number: taxNumber } : {}),
+            ...(taxNumber   ? { vat_or_tax_id: taxNumber   } : {}),
           },
         };
 
-        // Wenn Firmenname gesetzt ist -> Zeile 1 der Anschrift/Rechnung: Firmenname
+        // Name-Logik:
+        // Wenn Firma angegeben, soll der **Customer-Name** die Firma sein,
+        // damit Rechnung/Zahlungsbeleg oben die Firma tragen (statt Vor-/Nachname).
         if (companyName) {
-          customerUpdate.name = companyName;
+          update.name = companyName;
         }
 
-        // Custom Fields, die auf Rechnung & Beleg angezeigt werden
-        const customFields = [];
-        if (companyName) customFields.push({ name: "Company", value: companyName });
-        if (taxNumber)   customFields.push({ name: "Tax ID",  value: taxNumber });
-
+        // Custom-Felder nur setzen, wenn vorhanden
         if (customFields.length) {
-          customerUpdate.invoice_settings = { custom_fields: customFields };
+          update.invoice_settings = { custom_fields: customFields };
         }
 
-        if (Object.keys(customerUpdate).length > 0) {
-          console.log("[WH] Updating customer with:", customerUpdate);
-          await stripe.customers.update(customerId, customerUpdate);
+        if (Object.keys(update).length) {
+          log("Updating customer with:", update);
+          await stripe.customers.update(customerId, update);
         } else {
-          console.log("[WH] Nothing to update on customer.");
+          log("Nothing to update on customer.");
         }
 
         break;
       }
 
-      // =========================================================
-      // B) Rechnung wurde finalisiert -> falls Kunde schon
-      //    aktualisiert ist, aber Rechnung noch nichts hat,
-      //    kopieren wir die Felder auf die Rechnung.
-      // =========================================================
+      // =====================================================================
+      // 2) Fallback: Wenn Rechnung finalized, aber (noch) keine custom_fields hat
+      //    → Kopiere sie vom Customer auf die Rechnung
+      // =====================================================================
       case "invoice.finalized": {
         const invoice = event.data.object;
-        console.log("[WH] invoice.finalized:", { id: invoice?.id });
+        log("invoice id:", invoice?.id, "customer:", invoice?.customer);
 
-        // wenn Rechnung bereits Custom Fields hat -> nichts tun
-        if (invoice.custom_fields?.length) {
-          console.log("[WH] invoice already has custom_fields, skipping.");
+        //  Guard 1: Ohne Customer kein Update
+        if (!invoice?.customer) {
+          log("No customer on invoice, skipping.");
           break;
         }
-        if (!invoice.customer) break;
 
-        const cust = await stripe.customers.retrieve(invoice.customer);
-        const cf = cust?.invoice_settings?.custom_fields || [];
-
-        if (cf.length) {
-          console.log("[WH] Copying custom_fields from customer -> invoice:", cf);
-          await stripe.invoices.update(invoice.id, { custom_fields: cf });
-        } else {
-          console.log("[WH] No customer custom_fields to copy.");
+        //  Guard 2: Falls die Rechnung bereits Custom Fields hat → nichts tun
+        if (invoice.custom_fields?.length) {
+          log("Invoice already has custom_fields, skipping.");
+          break;
         }
+
+        try {
+          // Customer abrufen und seine evtl. gesetzten Custom Fields lesen
+          const cust = await stripe.customers.retrieve(invoice.customer);
+          const cf = cust?.invoice_settings?.custom_fields || [];
+
+          if (cf.length) {
+            log("Copying customer.custom_fields to invoice:", cf);
+            await stripe.invoices.update(invoice.id, { custom_fields: cf });
+          } else {
+            log("Customer has no invoice_settings.custom_fields to copy.");
+          }
+        } catch (err) {
+          // Wichtig: Fehler hier **nicht** nach oben werfen, sonst 500 → Stripe retried ewig.
+          console.error("[invoice.finalized] copy custom_fields failed:", err.message);
+        }
+
         break;
       }
 
-      // Andere Events bewusst ignorieren
       default:
-        // console.log("[WH] Ignored event:", event.type);
+        // Andere Events ignorieren wir bewusst
+        log("ignored");
         break;
     }
 
-    // Stripe braucht 2xx, sonst wird erneut zugestellt
+    // Stripe muss 2xx sehen, sonst retried es
     return res.status(200).json({ received: true });
   } catch (err) {
+    // Nur „letzte Verteidigungslinie“. Oben möglichst einzeln try/catchen,
+    // damit wir hier nicht in ein 500-Retry-Loch geraten.
     console.error("❌ Webhook handler error:", err);
-    // Absichtlich kein 2xx -> Stripe retried mit Backoff
+    // 2xx NICHT senden, damit Stripe mit Backoff erneut zustellt
     return res.status(500).json({ error: "webhook_handler_error" });
   }
 }
