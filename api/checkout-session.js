@@ -47,32 +47,35 @@ export default async function handler(req, res) {
     // - Keine customer_email setzen.
 
     const sessionParams = {
-      ui_mode: "embedded",
-      mode,
-      line_items: [{ price, quantity: 1 }],
-      return_url: `${thankYouUrl || "https://ai-business-engine.com/thank-you"}?plan=${encodeURIComponent(plan)}&total=${totals[plan] || ""}&session_id={CHECKOUT_SESSION_ID}`,
+  ui_mode: "embedded",
+  mode,
+  line_items: [{ price, quantity: 1 }],
+  return_url: `${thankYouUrl || "https://ai-business-engine.com/thank-you"}?plan=${encodeURIComponent(plan)}&total=${totals[plan] || ""}&session_id={CHECKOUT_SESSION_ID}`,
 
-      // Adresse einsammeln (erhöht Chance auf vollständige Rechnungsadresse)
-      billing_address_collection: "required",
-      tax_id_collection: { enabled: false },
-      phone_number_collection: { enabled: false },
+  customer_email: email || "", // *** WICHTIG ***
+// - Kein customer Objekt vorab zuordnen -> E-Mail bleibt editierbar.
+// - customer_creation nur für Einmalzahlung aktivieren.
+// - customer_email darf gesetzt werden (nur für Vorbefüllung).
 
-      // Eigene Felder – bleiben gleich
-      custom_fields: [
-        {
-          key: "company_name",
-          label: { type: "custom", custom: "Firmenname (optional)" },
-          type: "text",
-          optional: true,
-        },
-        {
-          key: "company_tax_number",
-          label: { type: "custom", custom: "Steuernummer / VAT (optional)" },
-          type: "text",
-          optional: true,
-        },
-      ],
-    };
+  billing_address_collection: "required",
+  tax_id_collection: { enabled: false },
+  phone_number_collection: { enabled: false },
+
+  custom_fields: [
+    {
+      key: "company_name",
+      label: { type: "custom", custom: "Firmenname (optional)" },
+      type: "text",
+      optional: true,
+    },
+    {
+      key: "company_tax_number",
+      label: { type: "custom", custom: "Steuernummer / VAT (optional)" },
+      type: "text",
+      optional: true,
+    },
+  ],
+};
 
     // Nur bei Einmalzahlung: Customer-Objekt automatisch nach Checkout erzeugen
     if (mode === "payment") {
