@@ -76,7 +76,7 @@ export default async function handler(req, res) {
 
     // Nur bei Einmalzahlung: Customer-Objekt automatisch nach Checkout erzeugen
     if (mode === "payment") {
-      sessionParams.customer_creation = { enabled: true };
+      sessionParams.customer_creation = "always";
 
       // Rechnung nach Zahlung erzeugen + Metadaten mitgeben
       sessionParams.invoice_creation = {
