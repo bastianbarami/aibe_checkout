@@ -1,18 +1,17 @@
 // api/stripe-webhook.js
 import { buffer } from "micro";
 
-export const runtime = 'nodejs';
 export const config = {
   api: {
-    bodyParser: false, // Stripe braucht raw body
+    bodyParser: false, // raw body für Stripe-Signatur
   },
 };
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).end("Method Not Allowed");
 
-  const stripeSecret   = process.env.STRIPE_SECRET_KEY;
-  const webhookSecret  = process.env.STRIPE_WEBHOOK_SECRET;
+  const stripeSecret = process.env.STRIPE_SECRET_KEY;
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
   if (!stripeSecret || !webhookSecret) {
     console.error("[WH] Missing env STRIPE_SECRET_KEY or STRIPE_WEBHOOK_SECRET");
     return res.status(500).json({ error: "missing_env" });
@@ -20,7 +19,6 @@ export default async function handler(req, res) {
 
   const stripe = (await import("stripe")).default(stripeSecret);
 
-  // --- Event verifizieren
   let event;
   try {
     const sig = req.headers["stripe-signature"];
@@ -31,74 +29,96 @@ export default async function handler(req, res) {
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
+  // ---- Helper --------------------------------------------------------------
+  const getCompanyFromCust = (cust) => {
+    const fromCF =
+      cust?.invoice_settings?.custom_fields?.find(f => f?.name === "Company")?.value?.trim() || "";
+    const fromMeta = cust?.metadata?.company_name?.trim() || "";
+    return fromCF || fromMeta;
+  };
+
+  const getTaxFromCust = (cust) => {
+    const fromCF =
+      cust?.invoice_settings?.custom_fields?.find(f => f?.name === "Tax ID")?.value?.trim() || "";
+    const fromMeta = cust?.metadata?.vat_or_tax_id?.trim() || "";
+    return fromCF || fromMeta;
+  };
+
   try {
     switch (event.type) {
-      // A) Unmittelbar nach erfolgreichem Checkout
+      // 1) Direkt nach dem Checkout: wir speichern nur Werte am Customer,
+      //    ändern aber NICHT den customer.name (Personenname soll bleiben)
       case "checkout.session.completed": {
         const session = event.data.object;
-        const customerId = session.customer;
-        if (!customerId) break;
 
-        // Custom-Felder aus der Session lesen
-        const findTextField = (key) => {
-          const f = (session.custom_fields || []).find((x) => x.key === key);
-          return f?.text?.value || null;
+        if (!session.customer) break;
+
+        const getCF = (key) => {
+          const f = (session.custom_fields || []).find(x => x.key === key);
+          return f?.text?.value?.trim() || "";
         };
-        const companyName = findTextField("company_name");
-        const taxId       = findTextField("company_tax_number") || findTextField("tax_id");
+        const company = getCF("company_name");
+        const taxno   = getCF("company_tax_number");
 
-        const customFields = [];
-        if (companyName) customFields.push({ name: "Company", value: companyName });
-        if (taxId)       customFields.push({ name: "Tax ID",  value: taxId });
-
-        const update = {
-          metadata: {
-            ...(companyName ? { company_name: companyName } : {}),
-            ...(taxId ? { vat_or_tax_id: taxId } : {}),
-          },
+        // Zusammenbauen, was wir am Customer persistieren möchten
+        const metadata = {
+          ...(company ? { company_name: company } : {}),
+          ...(taxno   ? { vat_or_tax_id: taxno }   : {}),
         };
-        if (companyName) update.name = companyName; // <-- Customer-Name auf Firma setzen
-        if (customFields.length) {
-          update.invoice_settings = { custom_fields: customFields };
+
+        const custom_fields = [
+          ...(company ? [{ name: "Company", value: company }] : []),
+          ...(taxno   ? [{ name: "Tax ID",  value: taxno   }] : []),
+        ];
+
+        const update = {};
+        if (Object.keys(metadata).length) update.metadata = metadata;
+        if (custom_fields.length) {
+          update.invoice_settings = { custom_fields };
         }
 
-        if (Object.keys(update).length > 0) {
-          await stripe.customers.update(customerId, update);
+        if (Object.keys(update).length) {
+          await stripe.customers.update(session.customer, update);
         }
         break;
       }
 
-      // B) Erste Rechnung erstellen -> Firma SOFORT in den Adressblock
-      case "invoice.created": {
+      // 2) Sobald eine Rechnung erzeugt wird:
+      //    - Wenn Firmenname vorhanden → setze ihn als customer_name auf der Rechnung
+      //    - Custom-Fields (Company/Tax ID) auf der Rechnung setzen, falls noch leer
+      case "invoice.created":
+      case "invoice.finalized": {
         const invoice = event.data.object;
 
         if (!invoice.customer) break;
+
         const cust = await stripe.customers.retrieve(invoice.customer);
+        const company = getCompanyFromCust(cust);
+        const taxno   = getTaxFromCust(cust);
 
-        const cf = cust?.invoice_settings?.custom_fields || [];
-        const companyFromCF = cf.find(x => (x.name || "").toLowerCase() === "company")?.value;
-        const companyFromMeta = cust?.metadata?.company_name;
-        const fallbacks = [companyFromCF, companyFromMeta, cust?.name].filter(Boolean);
-        const company = fallbacks[0];
+        const patch = {};
 
-        const upd = {};
-        if (company) upd.customer_name = company;
-        // Falls du die gleichen Custom Fields auf die Rechnung spiegeln willst:
-        if (cf?.length) upd.custom_fields = cf;
-
-        if (Object.keys(upd).length) {
-          await stripe.invoices.update(invoice.id, upd);
+        // a) Firmenname NUR setzen, wenn tatsächlich vorhanden
+        if (company) {
+          patch.customer_name = company;
         }
-        break;
-      }
 
-      // (optional) Prüfung nach Finalisierung
-      case "invoice.finalized": {
-        // Hier brauchst du nichts zu tun, weil wir bereits bei invoice.created gesetzt haben.
+        // b) Custom-Fields nur ergänzen, wenn auf Rechnung noch nicht gesetzt
+        if (!invoice.custom_fields?.length) {
+          const cfs = [];
+          if (company) cfs.push({ name: "Company", value: company });
+          if (taxno)   cfs.push({ name: "Tax ID",  value: taxno   });
+          if (cfs.length) patch.custom_fields = cfs;
+        }
+
+        if (Object.keys(patch).length) {
+          await stripe.invoices.update(invoice.id, patch);
+        }
         break;
       }
 
       default:
+        // andere Events ignorieren
         break;
     }
 
