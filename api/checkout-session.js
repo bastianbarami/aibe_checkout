@@ -122,7 +122,7 @@ export default async function handler(req, res) {
 
     // WICHTIG: Customer im Checkout erstellen lassen (E-Mail bleibt editierbar)
     if (mode === "payment") {
-      sessionParams.customer_creation = { enabled: true };
+      sessionParams.customer_creation ="always";
     }
 
     // Metadaten + Rechnungserstellung bei Einmalzahlungen
