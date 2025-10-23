@@ -17,48 +17,56 @@ export default async function handler(req, res) {
   const stripe = (await import("stripe")).default(stripeSecret);
 
   try {
-    const {
-      plan = "aibe_pif",
-      email = "",
-      name = "",
-      thankYouUrl
-    } = await readJson(req);
+    const { plan = "one_time", email = "", name = "", thankYouUrl } = await readJson(req);
 
-    // --- Preise per ENV (falls wir gespeicherte Prices weiter nutzen wollen)
+    // Preise aus Env
     const PRICE_ONE_TIME = process.env.PRICE_ONE_TIME;
     const PRICE_SPLIT_2  = process.env.PRICE_SPLIT_2;
     const PRICE_SPLIT_3  = process.env.PRICE_SPLIT_3;
 
-    // --- Optional: Inline-Price-Data nutzen (versteckt Bilder/Beschreibung im Checkout)
-    // Setze in Vercel ENV: USE_INLINE_PRICE_DATA=true um diese Variante zu aktivieren.
-    const USE_INLINE_PRICE_DATA = String(process.env.USE_INLINE_PRICE_DATA || "")
-      .toLowerCase() === "true";
-
-    // Deine Beträge in Cent für inline price_data
-    const INLINE = {
-      aibe_pif:      { currency: "eur", unit_amount: 49900, mode: "payment" },
-      aibe_split_2:  { currency: "eur", unit_amount: 25750, mode: "subscription", recurring: { interval: "month", interval_count: 1 } }, // 2 Monate manuell kündigen/automatisieren
-      aibe_split_3:  { currency: "eur", unit_amount: 17500, mode: "subscription", recurring: { interval: "month", interval_count: 1 } }, // 3 Monate manuell kündigen/automatisieren
-      one_time:      { currency: "eur", unit_amount: 49900, mode: "payment" },
-      split_2:       { currency: "eur", unit_amount: 25750, mode: "subscription", recurring: { interval: "month", interval_count: 1 } },
-      split_3:       { currency: "eur", unit_amount: 17500, mode: "subscription", recurring: { interval: "month", interval_count: 1 } },
+    const priceMap = {
+      one_time: PRICE_ONE_TIME,
+      split_2:  PRICE_SPLIT_2,
+      split_3:  PRICE_SPLIT_3,
+      aibe_pif: PRICE_ONE_TIME,
+      aibe_split_2: PRICE_SPLIT_2,
+      aibe_split_3: PRICE_SPLIT_3,
     };
+    const totals = { aibe_pif: 499, aibe_split_2: 515, aibe_split_3: 525 };
+
+    const price = priceMap[plan];
+    if (!price) return res.status(400).json({ error: "Unknown plan" });
 
     const isSub = ["split_2", "aibe_split_2", "split_3", "aibe_split_3"].includes(plan);
-    const mode  = isSub ? "subscription" : "payment";
+    const mode = isSub ? "subscription" : "payment";
 
-    // Wir geben KEINEN customer & KEIN customer_email vor -> E-Mail ist im Checkout editierbar.
+    // Customer vorab anlegen/suchen – wichtig, damit wir ID in der Session fix haben
+    let customerId;
+    if (email) {
+      const found = await stripe.customers.list({ email, limit: 1 });
+      if (found.data.length) {
+        customerId = found.data[0].id;
+        // Namen setzen, falls leer
+        if (name && !found.data[0].name) await stripe.customers.update(customerId, { name });
+      } else {
+        const created = await stripe.customers.create({ email, name });
+        customerId = created.id;
+      }
+    }
+
+    // Session-Parameter
     const sessionParams = {
       ui_mode: "embedded",
       mode,
-      return_url: `${thankYouUrl || "https://ai-business-engine.com/thank-you"}?plan=${encodeURIComponent(plan)}&session_id={CHECKOUT_SESSION_ID}`,
+      line_items: [{ price, quantity: 1 }],
+      // Keine Produktbeschreibung/Media per API steuerbar – kommt vom Produkt/Preis im Dashboard.
+      return_url: `${thankYouUrl || "https://ai-business-engine.com/thank-you"}?plan=${encodeURIComponent(plan)}&total=${totals[plan] || ""}&session_id={CHECKOUT_SESSION_ID}`,
 
-      // Adress- & Zusatzfelder
       billing_address_collection: "required",
       tax_id_collection: { enabled: false },
       phone_number_collection: { enabled: false },
 
-      // Firma & Steuernummer vom Checkout erfassen
+      // Custom Fields am Checkout
       custom_fields: [
         {
           key: "company_name",
@@ -73,60 +81,21 @@ export default async function handler(req, res) {
           optional: true
         }
       ],
+
+      customer: customerId || undefined,
+      customer_email: customerId ? undefined : (email || undefined),
     };
 
-    // Linie-Items definieren
-    if (USE_INLINE_PRICE_DATA) {
-      const cfg = INLINE[plan];
-      if (!cfg) return res.status(400).json({ error: "Unknown plan" });
-
-      if (mode === "payment") {
-        sessionParams.line_items = [{
-          price_data: {
-            currency: cfg.currency,
-            unit_amount: cfg.unit_amount,
-            product_data: {
-              // KEINE images / description => nichts anzeigen im Checkout-Header
-              name: "AI Business Engine"
-            }
-          },
-          quantity: 1
-        }];
-      } else {
-        sessionParams.line_items = [{
-          price_data: {
-            currency: cfg.currency,
-            unit_amount: cfg.unit_amount,
-            recurring: cfg.recurring,
-            product_data: {
-              name: "AI Business Engine"
-            }
-          },
-          quantity: 1
-        }];
-      }
-    } else {
-      // Fallback: gespeicherte Stripe-Preise (zeigt evtl. Produktbild/Beschreibung an)
-      const map = {
-        one_time: PRICE_ONE_TIME,
-        split_2:  PRICE_SPLIT_2,
-        split_3:  PRICE_SPLIT_3,
-        aibe_pif: PRICE_ONE_TIME,
-        aibe_split_2: PRICE_SPLIT_2,
-        aibe_split_3: PRICE_SPLIT_3,
+    // Metadaten passend setzen (damit der Webhook überall drankommt)
+    if (mode === "payment") {
+      sessionParams.payment_intent_data = {
+        metadata: {
+          plan,
+          form_email: email || "",
+          form_name:  name  || ""
+        }
       };
-      const price = map[plan];
-      if (!price) return res.status(400).json({ error: "Unknown plan" });
-      sessionParams.line_items = [{ price, quantity: 1 }];
-    }
-
-    // WICHTIG: Customer im Checkout erstellen lassen (E-Mail bleibt editierbar)
-    if (mode === "payment") {
-      sessionParams.customer_creation ="always";
-    }
-
-    // Metadaten + Rechnungserstellung bei Einmalzahlungen
-    if (mode === "payment") {
+      // Eine Rechnung für Einmalzahlung erstellen lassen
       sessionParams.invoice_creation = {
         enabled: true,
         invoice_data: {
@@ -136,13 +105,6 @@ export default async function handler(req, res) {
             form_email: email || "",
             form_name:  name  || ""
           }
-        }
-      };
-      sessionParams.payment_intent_data = {
-        metadata: {
-          plan,
-          form_email: email || "",
-          form_name:  name  || ""
         }
       };
     } else {
@@ -158,7 +120,7 @@ export default async function handler(req, res) {
     const session = await stripe.checkout.sessions.create(sessionParams);
     return res.status(200).json({ client_secret: session.client_secret });
   } catch (e) {
-    console.error("session error", e);
+    console.error("[session] error", e);
     return res.status(500).json({ error: e.message || "session_error" });
   }
 }
