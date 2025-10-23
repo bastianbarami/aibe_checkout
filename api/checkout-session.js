@@ -43,9 +43,8 @@ export default async function handler(req, res) {
     const mode = isSub ? "subscription" : "payment";
 
     // ----------------------------------------------------------------
-    // WICHTIG für editierbares E-Mail-Feld:
-    //   * KEIN 'customer' irgendwo setzen (auch nicht indirekt).
-    //   * NUR 'customer_email' setzen -> vorbefüllt & editierbar.
+    // KEINE Vorbefüllung oder Bindung an bestehende Customers.
+    // -> Email-Feld bleibt leer & immer editierbar.
     // ----------------------------------------------------------------
     const sessionParams = {
       ui_mode: "embedded",
@@ -54,9 +53,6 @@ export default async function handler(req, res) {
       return_url: `${
         thankYouUrl || "https://ai-business-engine.com/thank-you"
       }?plan=${encodeURIComponent(plan)}&total=${totals[plan] || ""}&session_id={CHECKOUT_SESSION_ID}`,
-
-      // Vorbefüllen, aber editierbar:
-      ...(email ? { customer_email: email } : {}),
 
       billing_address_collection: "required",
       tax_id_collection: { enabled: false },
@@ -79,11 +75,10 @@ export default async function handler(req, res) {
     };
 
     if (mode === "payment") {
-      // Für Einmalzahlung kann Stripe nach Abschluss automatisch einen Customer anlegen.
-      // Das beeinflusst die Editierbarkeit NICHT, solange wir HIER keinen bestehenden customer binden.
+      // Einmalzahlung → Customer erst NACH Checkout automatisch erzeugen
       sessionParams.customer_creation = "always";
 
-      // Rechnung erzeugen + Metadaten
+      // Rechnung + Metadaten
       sessionParams.invoice_creation = {
         enabled: true,
         invoice_data: {
@@ -97,7 +92,7 @@ export default async function handler(req, res) {
         },
       };
 
-      // Metadaten am Payment Intent (Auswertungen/Nachvollziehbarkeit)
+      // Metadaten am Payment Intent
       sessionParams.payment_intent_data = {
         metadata: {
           plan,
@@ -108,7 +103,6 @@ export default async function handler(req, res) {
     } else {
       // Abo-Fall: Metadaten an Subscription
       sessionParams.subscription_data = {
-        // KEIN 'customer' hier setzen!
         metadata: {
           plan,
           form_email: email || "",
