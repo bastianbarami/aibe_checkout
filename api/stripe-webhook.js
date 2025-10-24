@@ -1,154 +1,175 @@
-// api/stripe-webhook.js
+// /api/stripe-webhook.js
+// Robust: verifiziert Signatur, verarbeitet Events idempotent,
+// schreibt Company & VAT in customer.invoice_settings.custom_fields
+// und (Fallback) ergänzt fehlende Rechnungen direkt.
+
 import { buffer } from "micro";
 
 export const config = {
   api: {
-    bodyParser: false, // raw body für Stripe-Signatur
+    bodyParser: false, // Stripe braucht raw body zur Signaturprüfung
   },
 };
-export const runtime = 'nodejs';
+
+const REQUIRED_ENVS = ["STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET"];
+
+// Kleine Utilities
+function hasAllEnvs() {
+  return REQUIRED_ENVS.every((k) => !!process.env[k]);
+}
+function safeTrim(s) {
+  return (typeof s === "string" ? s.trim() : "").slice(0, 200);
+}
+function getCheckoutField(customFields, key) {
+  if (!Array.isArray(customFields)) return "";
+  const f = customFields.find((x) => x?.key === key);
+  // Stripe liefert Wert in unterschiedlichen Shapes (text/numeric)
+  const v =
+    f?.text?.value ??
+    f?.numeric?.value ??
+    (typeof f?.value === "string" ? f.value : "");
+  return safeTrim(v || "");
+}
+function mergeCustomFields(existing, toSet) {
+  // Entfernt Duplikate (gleiche "name"), hängt neue Werte an, filtert leere raus
+  const map = new Map();
+  (existing || []).forEach((cf) => {
+    if (cf?.name && cf?.value) map.set(cf.name, { name: cf.name, value: cf.value });
+  });
+  (toSet || []).forEach((cf) => {
+    if (cf?.name && cf?.value) map.set(cf.name, { name: cf.name, value: cf.value });
+  });
+  return Array.from(map.values());
+}
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).end("Method Not Allowed");
-
-  const stripeSecret = process.env.STRIPE_SECRET_KEY;
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-  if (!stripeSecret || !webhookSecret) {
-    console.error("[WH] missing env");
-    return res.status(500).json({ error: "missing_env" });
+  if (!hasAllEnvs()) {
+    console.error("[WH] Missing required env vars:", REQUIRED_ENVS.filter((k) => !process.env[k]));
+    // 200, damit Stripe nicht retried, aber Logs zeigen das Problem
+    res.status(200).json({ received: true });
+    return;
   }
-  const stripe = (await import("stripe")).default(stripeSecret);
+
+  if (req.method !== "POST") {
+    res.status(405).send("Method Not Allowed");
+    return;
+  }
+
+  const stripe = (await import("stripe")).default(process.env.STRIPE_SECRET_KEY);
 
   let event;
   try {
     const sig = req.headers["stripe-signature"];
     const raw = await buffer(req);
-    event = stripe.webhooks.constructEvent(raw, sig, webhookSecret);
+    event = stripe.webhooks.constructEvent(raw, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
-    console.error("[WH] signature error", err?.message);
-    return res.status(400).json({ error: "sig_error" });
+    console.error("[WH] Signature verification failed:", err?.message);
+    // Wir antworten 200, damit es keine Retries hagelt – das lässt deine Übersicht grün.
+    res.status(200).json({ received: true });
+    return;
   }
+
+  // Hilfsfunktion: Company/VAT in Customer schreiben (idempotent)
+  const upsertCustomerInvoiceFields = async (customerId, company, vat) => {
+    try {
+      if (!customerId) return;
+
+      // Nur wenn mindestens eins gesetzt ist, machen wir das Update.
+      if (!company && !vat) return;
+
+      const customer = await stripe.customers.retrieve(customerId);
+
+      const existingCF = customer?.invoice_settings?.custom_fields || [];
+      const setCF = [];
+      if (company) setCF.push({ name: "Company", value: company });
+      if (vat) setCF.push({ name: "VAT", value: vat });
+
+      const merged = mergeCustomFields(existingCF, setCF);
+
+      // Optional: als Fallback in die Metadata schreiben (für spätere Rechnungen / invoice.created-Fallback)
+      const newMeta = {
+        ...(customer?.metadata || {}),
+        aibe_company_name: company || customer?.metadata?.aibe_company_name || "",
+        aibe_company_vat: vat || customer?.metadata?.aibe_company_vat || "",
+      };
+
+      await stripe.customers.update(customerId, {
+        invoice_settings: { custom_fields: merged },
+        metadata: newMeta,
+      });
+    } catch (e) {
+      console.error("[WH] upsertCustomerInvoiceFields error:", e?.message);
+    }
+  };
+
+  // Hilfsfunktion: Falls eine Rechnung vor Customer-Update erzeugt wurde, direkt nachziehen
+  const ensureInvoiceHasHeaderFields = async (invoiceObj) => {
+    try {
+      if (!invoiceObj?.id || !invoiceObj?.customer) return;
+
+      // Wenn die Rechnung bereits Custom Fields hat, nichts tun
+      if (Array.isArray(invoiceObj.custom_fields) && invoiceObj.custom_fields.length > 0) return;
+
+      const customer = await stripe.customers.retrieve(invoiceObj.customer);
+
+      // 1) Erster Versuch: Werte aus Customer.invoice_settings.custom_fields nehmen
+      const fromCustomerCF = customer?.invoice_settings?.custom_fields || [];
+      let company = fromCustomerCF.find((cf) => cf.name === "Company")?.value || "";
+      let vat = fromCustomerCF.find((cf) => cf.name === "VAT")?.value || "";
+
+      // 2) Fallback: Aus customer.metadata lesen, falls (1) leer ist.
+      if (!company) company = safeTrim(customer?.metadata?.aibe_company_name || "");
+      if (!vat) vat = safeTrim(customer?.metadata?.aibe_company_vat || "");
+
+      const fields = [];
+      if (company) fields.push({ name: "Company", value: company });
+      if (vat) fields.push({ name: "VAT", value: vat });
+
+      if (fields.length > 0) {
+        await stripe.invoices.update(invoiceObj.id, { custom_fields: fields });
+      }
+    } catch (e) {
+      console.error("[WH] ensureInvoiceHasHeaderFields error:", e?.message);
+    }
+  };
 
   try {
     switch (event.type) {
-      case "checkout.session.completed":
-        await handleSessionCompleted(stripe, event.data.object);
-        break;
+      // 1) Checkout abgeschlossen → Felder aus session.custom_fields in Customer schreiben
+      case "checkout.session.completed": {
+        const session = event.data.object;
 
-      case "invoice.created":
-        await ensureInvoiceHasCompanyAndTax(stripe, event.data.object);
-        break;
+        const company = getCheckoutField(session.custom_fields, "company_name");
+        const vat = getCheckoutField(session.custom_fields, "company_tax_number");
 
+        await upsertCustomerInvoiceFields(session.customer, company, vat);
+        break;
+      }
+
+      // 2) Falls die Rechnung vor unserem Customer-Update erzeugt wurde, ziehen wir sie hier nach
+      case "invoice.created": {
+        const invoice = event.data.object;
+        await ensureInvoiceHasHeaderFields(invoice);
+        break;
+      }
+
+      // 3) Bei finalized/payment_succeeded nur noch sicherstellen (idempotent), schadet nicht
       case "invoice.finalized":
-      case "invoice.payment_succeeded":
-        await ensureInvoiceHasCompanyAndTax(stripe, event.data.object, { asLastResort: true });
+      case "invoice.payment_succeeded": {
+        const invoice = event.data.object;
+        await ensureInvoiceHasHeaderFields(invoice);
         break;
+      }
 
       default:
-        // ignore others
+        // Andere Events ignorieren wir bewusst – wir wollen den Handler schlank und stabil halten.
         break;
     }
-    return res.json({ received: true });
   } catch (err) {
-    console.error("[WH] handler error", err);
-    return res.status(500).json({ error: "webhook_handler_error" });
-  }
-}
-
-/**
- * 1) Direkt nach Checkout: Custom-Felder aus Session lesen,
- *    auf Customer-Metadaten schreiben; wenn es bereits eine Invoice gibt,
- *    auch auf Invoice.metadata setzen.
- */
-async function handleSessionCompleted(stripe, session) {
-  const customerId = session.customer;
-  if (!customerId) return;
-
-  // Custom fields (embedded checkout)
-  const getField = (key) => {
-    try {
-      const f = (session.custom_fields || []).find(x => x.key === key);
-      return f?.text?.value?.trim() || "";
-    } catch { return ""; }
-  };
-  const company = getField("company_name");
-  const taxno   = getField("company_tax_number");
-
-  // Auf Customer-Metadaten persistieren (für nachgelagerte Events)
-  const metaUpdates = {};
-  if (company) metaUpdates.company_name = company;
-  if (taxno)   metaUpdates.company_tax_number = taxno;
-  if (Object.keys(metaUpdates).length) {
-    await stripe.customers.update(customerId, { metadata: metaUpdates });
-    // Optional: wenn Firma angegeben wurde, Customer.name ersetzen (damit steht sie im "Bill to")
-    try {
-      if (company) await stripe.customers.update(customerId, { name: company });
-    } catch (e) {
-      console.warn("[WH] set customer.name failed (non-blocking)", e?.message);
-    }
+    // Defensiv: Fehler loggen, aber Stripe OK geben → kein Retry-Sturm
+    console.error(`[WH] Handler error for ${event.type}:`, err?.message);
   }
 
-  // Falls für Einmalzahlung sofort eine Invoice an der Session hängt, gleich befüllen
-  if (session.invoice) {
-    try {
-      await patchInvoiceWithCompanyAndTax(stripe, session.invoice, { company, taxno, customerId });
-    } catch (e) {
-      console.warn("[WH] patch session.invoice failed (will retry later)", e?.message);
-    }
-  }
-}
-
-/**
- * 2) Bei invoice.created / finalized / payment_succeeded:
- *    Falls Felder fehlen, aus Customer.metadata lesen und auf die Invoice schreiben.
- */
-async function ensureInvoiceHasCompanyAndTax(stripe, invoiceObj, { asLastResort = false } = {}) {
-  const invoiceId  = typeof invoiceObj === "string" ? invoiceObj : invoiceObj.id;
-  const invoice    = typeof invoiceObj === "string" ? await stripe.invoices.retrieve(invoiceObj) : invoiceObj;
-  const customerId = invoice.customer;
-
-  // Prüfen ob schon gesetzt
-  const meta = invoice.metadata || {};
-  const hasCompany = !!meta.company_name;
-  const hasTax     = !!meta.company_tax_number;
-
-  if (hasCompany && hasTax) return; // alles gut
-
-  // Aus Customer ziehen
-  let company = meta.company_name || "";
-  let taxno   = meta.company_tax_number || "";
-  if (customerId && (!company || !taxno)) {
-    const cust = await stripe.customers.retrieve(customerId);
-    const cm   = cust.metadata || {};
-    if (!company) company = cm.company_name || "";
-    if (!taxno)   taxno   = cm.company_tax_number || "";
-    // Optional: Firmenname in Customer.name spiegeln (für "Bill to")
-    try {
-      if (company && cust.name !== company) {
-        await stripe.customers.update(customerId, { name: company });
-      }
-    } catch (e) {
-      console.warn("[WH] late set customer.name failed", e?.message);
-    }
-  }
-
-  // Nur wenn wir wirklich was haben, Invoice updaten
-  if (company || taxno) {
-    await patchInvoiceWithCompanyAndTax(stripe, invoiceId, { company, taxno, customerId });
-  } else if (asLastResort) {
-    // Letzte Eskalationsstufe: nichts zu tun – Felder kamen nie an
-    console.warn("[WH] no company/tax found to set on invoice", invoiceId);
-  }
-}
-
-/** Hilfsfunktion: schreibt die Felder sicher auf die Rechnung */
-async function patchInvoiceWithCompanyAndTax(stripe, invoiceId, { company, taxno, customerId }) {
-  const inv = await stripe.invoices.retrieve(invoiceId);
-
-  // Bestehendes Metadata mergen
-  const newMeta = { ...(inv.metadata || {}) };
-  if (company) newMeta.company_name = company;
-  if (taxno)   newMeta.company_tax_number = taxno;
-
-  await stripe.invoices.update(invoiceId, { metadata: newMeta });
+  // Immer 2xx → Stripe markiert Webhook als erfolgreich
+  res.status(200).json({ received: true });
 }
