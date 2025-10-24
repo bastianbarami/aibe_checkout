@@ -1,216 +1,185 @@
 // api/stripe-webhook.js
 import { buffer } from "micro";
+import Stripe from "stripe";
 
-// WICHTIG für Vercel Edge/Node:
-export const runtime = 'nodejs';
 export const config = {
-  api: { bodyParser: false }, // raw body für Stripe-Signatur
+  api: { bodyParser: false }, // wichtig: raw body für Sig-Verifikation
+  runtime: "nodejs",
 };
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+  apiVersion: "2020-08-27",
+});
+
+const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+// --- Hilfsfunktionen -------------------------------------------------
+
+/** Extrahiert Werte aus Checkout-Session.custom_fields */
+function getCompanyFieldsFromSession(session) {
+  const out = { companyName: null, taxNumber: null };
+  try {
+    const fields = session?.custom_fields || [];
+    for (const f of fields) {
+      if (f?.key === "company_name") {
+        out.companyName = f?.text?.value?.trim() || null;
+      }
+      if (f?.key === "company_tax_number") {
+        out.taxNumber = f?.text?.value?.trim() || null;
+      }
+    }
+  } catch {}
+  return out;
+}
+
+/** baut Invoice.custom_fields Array nur mit vorhandenen Werten */
+function buildInvoiceCustomFields({ companyName, taxNumber }) {
+  const arr = [];
+  if (companyName) arr.push({ name: "Company", value: companyName });
+  if (taxNumber) arr.push({ name: "Tax ID", value: taxNumber });
+  return arr.length ? arr : null;
+}
+
+/** Sucht eine DRAFT-Invoice des Kunden, falls session.invoice noch nicht expandiert war */
+async function findLatestDraftInvoiceForCustomer(customerId) {
+  const list = await stripe.invoices.list({
+    customer: customerId,
+    limit: 1,
+    status: "draft",
+  });
+  return list.data?.[0] || null;
+}
+
+/** Setzt Felder in die Rechnung und finalisiert sie (idempotent pro eventId) */
+async function applyFieldsAndFinalizeInvoice(invoice, fields, eventId) {
+  const { companyName, taxNumber } = fields || {};
+  const customFields = buildInvoiceCustomFields({ companyName, taxNumber });
+
+  // Nichts zu tun?
+  if (!customFields && !companyName) return;
+
+  // Update-Params für die Rechnung
+  const updateParams = {};
+  if (customFields) updateParams.custom_fields = customFields;
+  if (companyName) updateParams.customer_name = companyName;
+
+  // Invoice updaten (idempotent pro Event)
+  const idempotencyKey = `inv-update-${invoice.id}-${eventId}`;
+  await stripe.invoices.update(invoice.id, updateParams, { idempotencyKey });
+
+  // Finalisieren, falls noch Entwurf
+  if (invoice.status === "draft" || invoice.status === "open") {
+    const idempotencyKeyFinalize = `inv-finalize-${invoice.id}-${eventId}`;
+    await stripe.invoices.finalizeInvoice(invoice.id, {
+      idempotencyKey: idempotencyKeyFinalize,
+    });
+  }
+}
+
+/** Fallback: Werte temporär am Customer ablegen (Metadata), damit invoice.created sie greifen kann */
+async function stashFieldsOnCustomer(customerId, fields, eventId) {
+  const meta = {};
+  if (fields.companyName) meta.company_name_from_checkout = fields.companyName;
+  if (fields.taxNumber) meta.company_tax_number_from_checkout = fields.taxNumber;
+  if (Object.keys(meta).length === 0) return;
+
+  await stripe.customers.update(
+    customerId,
+    { metadata: meta },
+    { idempotencyKey: `cust-stash-${customerId}-${eventId}` }
+  );
+}
+
+/** Liest Fallback-Werte vom Customer.metadata wieder aus */
+function readStashedFieldsFromCustomer(customer) {
+  const m = customer?.metadata || {};
+  const companyName = (m.company_name_from_checkout || "").trim() || null;
+  const taxNumber = (m.company_tax_number_from_checkout || "").trim() || null;
+  return { companyName, taxNumber };
+}
+
+// --- Webhook Handler -------------------------------------------------
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).end("Method Not Allowed");
   }
 
-  const stripeSecret = process.env.STRIPE_SECRET_KEY;
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-  if (!stripeSecret || !webhookSecret) {
-    console.error("[WH] missing env STRIPE_SECRET_KEY or STRIPE_WEBHOOK_SECRET");
-    return res.status(500).json({ error: "missing_env" });
-  }
-
-  const stripe = (await import("stripe")).default(stripeSecret);
-
   let event;
   try {
-    const raw = await buffer(req);
     const sig = req.headers["stripe-signature"];
-    event = stripe.webhooks.constructEvent(raw, sig, webhookSecret);
+    const buf = await buffer(req);
+    event = stripe.webhooks.constructEvent(buf, sig, endpointSecret);
   } catch (err) {
     console.error("[WH] signature error:", err?.message);
-    return res.status(400).json({ error: "invalid_signature" });
+    return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
   try {
     switch (event.type) {
+      // Präferierter Pfad: Wir haben die Session + (Entwurfs-)Rechnung
       case "checkout.session.completed": {
-        const session = await stripe.checkout.sessions.retrieve(event.data.object.id, {
-          expand: ["customer", "invoice", "subscription.latest_invoice"],
+        const sessionId = event.data.object.id;
+        const session = await stripe.checkout.sessions.retrieve(sessionId, {
+          expand: ["invoice", "customer", "payment_intent"],
         });
 
-        // 1) Daten aus Custom Fields ziehen
-        const { companyName, taxNumber } = readCompanyAndVatFromSession(session);
+        const fields = getCompanyFieldsFromSession(session);
+        const customerId = session.customer || session.customer_id;
+        let invoice = session.invoice || null;
 
-        // 2) Kunde anreichern (metadata + invoice_settings für künftige Rechnungen)
-        if (session.customer) {
-          await upsertCustomerInvoiceDefaults(stripe, session.customer, { companyName, taxNumber });
+        // Falls die Invoice hier noch nicht expandiert/rückgeliefert wurde, versuchen wir sie zu finden
+        if (!invoice && customerId) {
+          const draft = await findLatestDraftInvoiceForCustomer(customerId);
+          if (draft) invoice = draft;
         }
 
-        // 3) Bestehende Rechnung (falls vorhanden & noch nicht final) sofort anreichern
-        const candidateInvoiceId =
-          session?.invoice?.id ??
-          session?.subscription?.latest_invoice ??
-          null;
-
-        if (candidateInvoiceId) {
-          await ensureInvoiceHasCompanyAndVat(stripe, candidateInvoiceId, {
-            companyName,
-            taxNumber,
-          });
+        if (invoice) {
+          await applyFieldsAndFinalizeInvoice(invoice, fields, event.id);
+        } else if (customerId) {
+          // Fallback: stash am Customer, damit invoice.created kurz danach zugreifen kann
+          await stashFieldsOnCustomer(customerId, fields, event.id);
         }
         break;
       }
 
+      // Fallback-Pfad: Rechnung ist als Entwurf da, Session-Event kam später
       case "invoice.created": {
-        const inv = event.data.object;
+        const invoice = event.data.object;
+        if (invoice?.status !== "draft") break;
 
-        // Nur reagieren, wenn noch bearbeitbar
-        if (inv.status === "draft" || inv.status === "open") {
-          // Werte bevorzugt vom Customer nehmen (falls Session-Rennen schon vorbei)
-          let companyName = null;
-          let taxNumber = null;
+        // Nur reagieren, wenn auto_advance:false (unser Flow)
+        const autoAdvance = invoice.auto_advance === false;
+        if (!autoAdvance) break;
 
-          if (inv.customer) {
-            const customer = await stripe.customers.retrieve(inv.customer);
-            if (customer?.metadata?.company_name) companyName = customer.metadata.company_name;
-            if (customer?.metadata?.tax_number) taxNumber = customer.metadata.tax_number;
+        // Werte vom Customer-Metadata ziehen (falls zuvor gestasht)
+        const customerId = invoice.customer;
+        if (!customerId) break;
 
-            // Falls im Customer bereits invoice_settings.custom_fields gepflegt sind,
-            // müssen wir nur noch customer_name für die Anzeige setzen.
-            const hasInvoiceCustomFields = Array.isArray(customer?.invoice_settings?.custom_fields)
-              ? customer.invoice_settings.custom_fields.length > 0
-              : false;
+        const customer = await stripe.customers.retrieve(customerId);
+        const fields = readStashedFieldsFromCustomer(customer);
 
-            await ensureInvoiceHasCompanyAndVat(
-              stripe,
-              inv.id,
-              { companyName, taxNumber },
-              { skipCustomFieldsIfAlreadyOnCustomer: hasInvoiceCustomFields }
-            );
-          }
-        }
+        // Nichts? Dann nichts tun.
+        if (!fields.companyName && !fields.taxNumber) break;
+
+        await applyFieldsAndFinalizeInvoice(invoice, fields, event.id);
         break;
       }
 
-      // Optional: Nur Logging – keine mutierenden Operationen nach Finalisierung.
-      case "invoice.finalized": {
-        // Prüfen & loggen, ob Felder drauf sind – andernfalls nur warnen.
-        const inv = event.data.object;
-        if (!hasCustomFields(inv)) {
-          console.warn("[WH] invoice.finalized without custom_fields; id=", inv.id);
-        }
-        if (!inv.customer_name) {
-          console.warn("[WH] invoice.finalized without customer_name; id=", inv.id);
-        }
-        break;
-      }
-
+      // Für Vollständigkeit: bereits erfolgreich bezahlt
+      case "invoice.payment_succeeded":
+      case "invoice.finalized":
+      case "checkout.session.completed":
       default:
-        // bewusst ignorieren
+        // keine Aktion nötig
         break;
     }
 
-    return res.status(200).json({ received: true });
+    // Immer 200, damit Stripe nicht erneut sendet (idempotente internen Aufrufe sichern robustes Verhalten)
+    return res.json({ received: true });
   } catch (err) {
-    // Robust: niemals Stack nach außen geben, aber intern loggen
     console.error("[WH] handler error:", err);
-    return res.status(200).json({ received: true }); // 200 zurück, damit Stripe nicht retry-stürmt
+    // Trotzdem 200 zurückgeben, um Endless-Retries zu vermeiden (wir sind intern idempotent)
+    return res.json({ received: true, warn: "handler_error" });
   }
-}
-
-/* ---------------------- Hilfsfunktionen ---------------------- */
-
-function readCompanyAndVatFromSession(session) {
-  let companyName = null;
-  let taxNumber = null;
-
-  const list = Array.isArray(session?.custom_fields) ? session.custom_fields : [];
-  for (const f of list) {
-    try {
-      const k = (f?.key || "").toLowerCase();
-      const v = f?.text?.value?.trim?.() ?? "";
-      if (!v) continue;
-      if (k === "company_name" || k === "company" || k === "firmenname") companyName = v;
-      if (k === "tax_number" || k === "vat" || k === "steuernummer") taxNumber = v;
-    } catch {}
-  }
-  return { companyName, taxNumber };
-}
-
-async function upsertCustomerInvoiceDefaults(stripe, customerObj, { companyName, taxNumber }) {
-  const customerId = typeof customerObj === "string" ? customerObj : customerObj.id;
-
-  // Hole aktuellen Zustand, um idempotent zu mergen
-  const customer = await stripe.customers.retrieve(customerId);
-
-  const metadata = { ...(customer.metadata || {}) };
-  if (companyName) metadata.company_name = companyName;
-  if (taxNumber) metadata.tax_number = taxNumber;
-
-  // invoice_settings.custom_fields immer gepflegt – so erben ALLE künftigen Rechnungen die Infos
-  const customFields = Array.isArray(customer?.invoice_settings?.custom_fields)
-    ? [...customer.invoice_settings.custom_fields]
-    : [];
-
-  const upsert = (name, value) => {
-    if (!value) return;
-    const i = customFields.findIndex((x) => x?.name === name);
-    if (i >= 0) customFields[i] = { name, value };
-    else customFields.push({ name, value });
-  };
-
-  upsert("Company", companyName || "");
-  upsert("VAT", taxNumber || "");
-
-  await stripe.customers.update(customerId, {
-    metadata,
-    invoice_settings: { custom_fields: customFields },
-  });
-}
-
-async function ensureInvoiceHasCompanyAndVat(
-  stripe,
-  invoiceId,
-  { companyName, taxNumber },
-  opts = {}
-) {
-  const { skipCustomFieldsIfAlreadyOnCustomer = false } = opts;
-  const inv = await stripe.invoices.retrieve(invoiceId);
-
-  // Nach Finalisierung nichts mehr mutieren
-  if (inv.status === "paid" || inv.status === "void" || inv.status === "uncollectible" || inv.finalized_at) {
-    return;
-  }
-
-  const patches = {};
-
-  // a) „Bill to“: Firmenname in customer_name setzen, falls vorhanden und noch nicht gesetzt
-  if (companyName && !inv.customer_name) {
-    patches.customer_name = companyName;
-  }
-
-  // b) Kopfzeilen-Felder (Custom Fields) auf der Rechnung
-  if (!skipCustomFieldsIfAlreadyOnCustomer) {
-    const current = Array.isArray(inv.custom_fields) ? [...inv.custom_fields] : [];
-    const upsert = (name, value) => {
-      if (!value) return;
-      const i = current.findIndex((x) => x?.name === name);
-      if (i >= 0) current[i] = { name, value };
-      else current.push({ name, value });
-    };
-
-    if (companyName) upsert("Company", companyName);
-    if (taxNumber) upsert("VAT", taxNumber);
-
-    patches.custom_fields = current;
-  }
-
-  // Nur updaten, wenn es etwas zu setzen gibt
-  if (Object.keys(patches).length > 0) {
-    await stripe.invoices.update(invoiceId, patches);
-  }
-}
-
-function hasCustomFields(inv) {
-  return Array.isArray(inv?.custom_fields) && inv.custom_fields.length > 0;
 }
