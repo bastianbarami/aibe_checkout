@@ -70,8 +70,8 @@ export default async function handler(req, res) {
         },
       ],
 
-      // KEINE Vorbelegung der E-Mail (damit das Feld nicht ausgegraut ist)
-      customer_email: null,
+      // ❌ Entfernt: KEINE Vorbelegung der E-Mail (damit das Feld nicht ausgegraut/invalid ist)
+      // customer_email: null,
     };
 
     // --- Metadaten nur fürs Mapping/Debug (beeinflusst Checkout-Felder nicht) ---
