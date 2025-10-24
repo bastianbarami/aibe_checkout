@@ -70,17 +70,16 @@ export default async function handler(req, res) {
         },
       ],
 
-      // ❌ Entfernt: KEINE Vorbelegung der E-Mail (damit das Feld nicht ausgegraut/invalid ist)
+      // ❌ Keine E-Mail vorbelegen
       // customer_email: null,
     };
 
     // --- Metadaten nur fürs Mapping/Debug (beeinflusst Checkout-Felder nicht) ---
     if (mode === "payment") {
-      // WICHTIG für Option A: Rechnung als ENTWURF erzeugen (auto_advance:false)
+      // Rechnung via invoice_creation aktivieren (ohne auto_advance – nicht unterstützt)
       sessionParams.invoice_creation = {
         enabled: true,
         invoice_data: {
-          auto_advance: false, // <-- entscheidend für den Webhook-Flow
           footer:
             "Reverse Charge – Die Steuerschuldnerschaft liegt beim Leistungsempfänger.",
           metadata: { plan, form_email: email || "", form_name: name || "" },
@@ -90,8 +89,7 @@ export default async function handler(req, res) {
         metadata: { plan, form_email: email || "", form_name: name || "" },
       };
     } else {
-      // Bei Subscription gibt es keine invoice_creation in Checkout;
-      // der Webhook fängt 'invoice.created' ab und setzt die Felder rechtzeitig.
+      // Subscription-Zweig
       sessionParams.subscription_data = {
         metadata: { plan, form_email: email || "", form_name: name || "" },
       };
