@@ -61,7 +61,7 @@ async function applyFieldsAndFinalizeInvoice(invoice, fields, eventId) {
   // Update-Params für die Rechnung
   const updateParams = {};
   if (customFields) updateParams.custom_fields = customFields;
-  if (companyName) updateParams.customer_name = companyName;
+  // ⚠️ entfernt: updateParams.customer_name = companyName;  // <-- Verboten auf Invoice-Ebene
 
   // Invoice updaten (idempotent pro Event)
   const idempotencyKey = `inv-update-${invoice.id}-${eventId}`;
