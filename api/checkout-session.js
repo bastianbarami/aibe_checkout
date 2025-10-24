@@ -70,13 +70,13 @@ export default async function handler(req, res) {
         },
       ],
 
-      // ❌ Keine E-Mail vorbelegen
-      // customer_email: null,
+      // KEINE Vorbelegung der E-Mail (damit das Feld nicht ausgegraut ist)
+      customer_email: null,
     };
 
     // --- Metadaten nur fürs Mapping/Debug (beeinflusst Checkout-Felder nicht) ---
     if (mode === "payment") {
-      // Rechnung via invoice_creation aktivieren (ohne auto_advance – nicht unterstützt)
+      // Rechnungserstellung an – ohne auto_advance (dieser Param ist hier nicht erlaubt)
       sessionParams.invoice_creation = {
         enabled: true,
         invoice_data: {
@@ -89,7 +89,7 @@ export default async function handler(req, res) {
         metadata: { plan, form_email: email || "", form_name: name || "" },
       };
     } else {
-      // Subscription-Zweig
+      // Subscription: Mapping nur in Metadata, Anpassungen später per Webhook
       sessionParams.subscription_data = {
         metadata: { plan, form_email: email || "", form_name: name || "" },
       };
