@@ -1,9 +1,10 @@
 // api/checkout-session.js
 export default async function handler(req, res) {
+  // --- CORS erlaubte Origins wie bei dir ---
   const ALLOWED = [
     "https://ai-business-engine.com",
     "https://www.ai-business-engine.com",
-    "https://baramiai-c98bd4c508b71b1b1c91ae95c029fc.webflow.io"
+    "https://baramiai-c98bd4c508b71b1b1c91ae95c029fc.webflow.io",
   ];
   const origin = req.headers.origin || "";
   if (ALLOWED.includes(origin)) res.setHeader("Access-Control-Allow-Origin", origin);
@@ -12,12 +13,13 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).end("Method Not Allowed");
 
+  // --- Stripe init ---
   const stripeSecret = process.env.STRIPE_SECRET_KEY;
   if (!stripeSecret) return res.status(500).json({ error: "Missing STRIPE_SECRET_KEY" });
-  const stripe = (await import("stripe")).default(stripeSecret);
+  const stripe = (await import("stripe")).default(stripeSecret, { apiVersion: "2020-08-27" });
 
   try {
-    // Wir lesen die Felder, benutzen sie aber NICHT um den Customer vorab zu binden!
+    // Wir lesen die Form-Felder, pre-füllen aber NICHT die Checkout-Email.
     const { plan = "one_time", email = "", name = "", thankYouUrl } = await readJson(req);
 
     const PRICE_ONE_TIME = process.env.PRICE_ONE_TIME;
@@ -39,50 +41,64 @@ export default async function handler(req, res) {
     const isSub = ["split_2", "aibe_split_2", "split_3", "aibe_split_3"].includes(plan);
     const mode = isSub ? "subscription" : "payment";
 
-    // KEIN customer, KEIN customer_email -> E-Mail-Feld bleibt frei editierbar
+    // --- Basiskonfiguration der Session ---
     const sessionParams = {
       ui_mode: "embedded",
       mode,
       line_items: [{ price, quantity: 1 }],
-      return_url: `${thankYouUrl || "https://ai-business-engine.com/thank-you"}?plan=${encodeURIComponent(plan)}&total=${totals[plan] || ""}&session_id={CHECKOUT_SESSION_ID}`,
+      // embedded flow -> return_url
+      return_url:
+        `${thankYouUrl || "https://ai-business-engine.com/thank-you"}?plan=${encodeURIComponent(plan)}&total=${totals[plan] || ""}&session_id={CHECKOUT_SESSION_ID}`,
+      // Rechnungsadresse erzwingen (brauchst du für den Adress-Block)
       billing_address_collection: "required",
       tax_id_collection: { enabled: false },
       phone_number_collection: { enabled: false },
+
+      // Custom Fields einsammeln (Firmenname & Steuernummer)
       custom_fields: [
         {
           key: "company_name",
           label: { type: "custom", custom: "Firmenname (optional)" },
           type: "text",
-          optional: true
+          optional: true,
         },
         {
           key: "company_tax_number",
           label: { type: "custom", custom: "Steuernummer / VAT (optional)" },
           type: "text",
-          optional: true
-        }
+          optional: true,
+        },
       ],
+
+      // KEINE Vorbelegung der E-Mail (damit das Feld nicht ausgegraut ist)
+      customer_email: null,
     };
 
-    // Nur Metadaten fürs Debugging/Mapping – beeinflusst die E-Mail nicht
+    // --- Metadaten nur fürs Mapping/Debug (beeinflusst Checkout-Felder nicht) ---
     if (mode === "payment") {
-      sessionParams.payment_intent_data = {
-        metadata: { plan, form_email: email || "", form_name: name || "" }
-      };
+      // WICHTIG für Option A: Rechnung als ENTWURF erzeugen (auto_advance:false)
       sessionParams.invoice_creation = {
         enabled: true,
         invoice_data: {
-          footer: "Reverse Charge – Die Steuerschuldnerschaft liegt beim Leistungsempfänger.",
-          metadata: { plan, form_email: email || "", form_name: name || "" }
-        }
+          auto_advance: false, // <-- entscheidend für den Webhook-Flow
+          footer:
+            "Reverse Charge – Die Steuerschuldnerschaft liegt beim Leistungsempfänger.",
+          metadata: { plan, form_email: email || "", form_name: name || "" },
+        },
+      };
+      sessionParams.payment_intent_data = {
+        metadata: { plan, form_email: email || "", form_name: name || "" },
       };
     } else {
+      // Bei Subscription gibt es keine invoice_creation in Checkout;
+      // der Webhook fängt 'invoice.created' ab und setzt die Felder rechtzeitig.
       sessionParams.subscription_data = {
-        metadata: { plan, form_email: email || "", form_name: name || "" }
+        metadata: { plan, form_email: email || "", form_name: name || "" },
       };
     }
 
     const session = await stripe.checkout.sessions.create(sessionParams);
+    // Dein Frontend erwartet nur den client_secret
     return res.status(200).json({ client_secret: session.client_secret });
   } catch (e) {
     console.error("[session] error", e);
@@ -91,7 +107,8 @@ export default async function handler(req, res) {
 }
 
 async function readJson(req) {
-  const c = [];
-  for await (const x of req) c.push(x);
-  return JSON.parse(Buffer.concat(c).toString("utf8") || "{}");
+  const chunks = [];
+  for await (const x of req) chunks.push(x);
+  const raw = Buffer.concat(chunks).toString("utf8") || "{}";
+  return JSON.parse(raw);
 }
