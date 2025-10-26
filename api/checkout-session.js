@@ -21,7 +21,7 @@ export default async function handler(req, res) {
     const stripe = (await import("stripe")).default(stripeSecret, { apiVersion: "2020-08-27" });
 
     // Eingaben lesen
-    const body = await readJson(req);
+    const body        = await readJson(req);
     const plan        = (body.plan || "one_time").trim();
     const thankYouUrl = (body.thankYouUrl || "https://ai-business-engine.com/thank-you").trim();
     const companyName = trimOrNull(body.companyName);
@@ -45,7 +45,7 @@ export default async function handler(req, res) {
     if (!price) return res.status(400).json({ error: "Unknown plan" });
 
     const isSub = ["split_2", "aibe_split_2", "split_3", "aibe_split_3"].includes(plan);
-    const mode = isSub ? "subscription" : "payment";
+    const mode  = isSub ? "subscription" : "payment";
 
     // Optional: Customer mit Invoice-Defaults nur wenn Company-Felder da sind
     let customerId = null;
@@ -73,32 +73,30 @@ export default async function handler(req, res) {
       billing_address_collection: "required",
       tax_id_collection: { enabled: false },
       phone_number_collection: { enabled: false },
+      // nur Anzeige-Felder im Checkout-UI
       custom_fields: [
         { key: "company_name",       label: { type:"custom", custom:"Firmenname (optional)" },        type:"text", optional:true },
         { key: "company_tax_number", label: { type:"custom", custom:"Steuernummer / VAT (optional)" }, type:"text", optional:true },
       ],
     };
+
     // Guards (SOP)
-    delete sessionParams.customer_email;
+    delete sessionParams.customer_email;         // niemals setzen
+    delete sessionParams.invoice_creation;       // HART: niemals Rechnungen über die Session
     if (customerId) sessionParams.customer = customerId;
 
     if (mode === "payment") {
-      sessionParams.invoice_creation = {
-        enabled: true,
-        invoice_data: {
-          footer: "Reverse Charge – Die Steuerschuldnerschaft liegt beim Leistungsempfänger.",
-          metadata: { plan },
-        },
-      };
+      // Nur PaymentIntent (KEINE Rechnung)
       sessionParams.payment_intent_data = { metadata: { plan } };
     } else {
+      // Abo: Metadaten auf die Subscription
       sessionParams.subscription_data = { metadata: { plan } };
     }
 
     const session = await stripe.checkout.sessions.create(sessionParams);
-    return res.status(200).json({ client_secret: session.client_secret, ver: "cors-hardened-01" });
+    return res.status(200).json({ client_secret: session.client_secret, ver: "no-invoice-creation-02" });
   } catch (e) {
-    // Immer JSON zurückgeben → nie „Failed to fetch“ im Browser wegen non-JSON
+    // Immer JSON zurückgeben → verhindert „Failed to fetch“
     console.error("[session] error", e);
     const msg = e?.message || "session_error";
     return res.status(500).json({ error: msg, code: e?.type || null });
