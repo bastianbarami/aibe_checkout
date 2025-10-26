@@ -19,16 +19,14 @@ export default async function handler(req, res) {
   const stripe = (await import("stripe")).default(stripeSecret, { apiVersion: "2020-08-27" });
 
   try {
-    // Eingaben lesen (Company-Felder sind optional!)
     const body = await readJson(req);
     const plan        = (body.plan || "one_time").trim();
     const thankYouUrl = (body.thankYouUrl || "https://ai-business-engine.com/thank-you").trim();
 
-    // Optional vorbelegte Unternehmensfelder (nur wenn du sie VOR dem Checkout im eigenen Formular abfragst)
+    // nur wenn du VORAB im eigenen UI was erfasst – optional
     const companyName = trimOrNull(body.companyName);
     const taxNumber   = trimOrNull(body.taxNumber);
 
-    // Price Mapping
     const PRICE_ONE_TIME = process.env.PRICE_ONE_TIME;
     const PRICE_SPLIT_2  = process.env.PRICE_SPLIT_2;
     const PRICE_SPLIT_3  = process.env.PRICE_SPLIT_3;
@@ -48,58 +46,55 @@ export default async function handler(req, res) {
     const isSub = ["split_2", "aibe_split_2", "split_3", "aibe_split_3"].includes(plan);
     const mode = isSub ? "subscription" : "payment";
 
-    // -------------------------------------------------------------
-    // (A) Optional: Customer anlegen, WENN Company-Felder vorhanden
-    // -------------------------------------------------------------
+    // (A) optional: Customer vorab anlegen, damit dessen invoice_defaults greifen
     let customerId = null;
     if (companyName || taxNumber) {
       const customFields = [
         ...(companyName ? [{ name: "Company", value: companyName }] : []),
-        ...(taxNumber   ? [{ name: "Tax ID", value: taxNumber }]   : []),
+        ...(taxNumber   ? [{ name: "Tax ID",  value: taxNumber }]   : []),
       ];
       const customer = await stripe.customers.create({
-        // bewusst KEINE Email/Name → vermeidet "Invalid email address" & SOP-Fehler
+        // keine Email/Name → SOP-konform
         invoice_settings: { custom_fields: customFields },
-        // optional: für spätere Fallbacks
         metadata: {
           company_name_from_prefill: companyName || "",
-          company_tax_number_from_prefill: taxNumber || ""
-        }
+          company_tax_number_from_prefill: taxNumber || "",
+        },
       });
       customerId = customer.id;
     }
 
-    // -------------------------------------------------------------
-    // (B) Checkout-Session aufsetzen (Embedded) – SOP-konform
-    // -------------------------------------------------------------
+    // (B) Session – eingebettet & SOP-konform
     const sessionParams = {
       ui_mode: "embedded",
       mode,
       line_items: [{ price, quantity: 1 }],
-      return_url: `${thankYouUrl}?plan=${encodeURIComponent(plan)}&total=${totals[plan] || ""}&session_id={CHECKOUT_SESSION_ID}`,
+      return_url:
+        `${thankYouUrl}?plan=${encodeURIComponent(plan)}&total=${totals[plan] || ""}&session_id={CHECKOUT_SESSION_ID}`,
       billing_address_collection: "required",
       tax_id_collection: { enabled: false },
       phone_number_collection: { enabled: false },
 
-      // Diese Custom Fields bleiben im UI bestehen (kein Konflikt).
-      // Sie sind nicht notwendig für Option A, aber schaden nicht.
+      // Stripe-Checkout-Customfields (UI), bleiben okay
       custom_fields: [
-        { key: "company_name",       label: { type:"custom", custom:"Firmenname (optional)" },        type:"text", optional:true },
-        { key: "company_tax_number", label: { type:"custom", custom:"Steuernummer / VAT (optional)" }, type:"text", optional:true },
+        { key: "company_name",       label: { type: "custom", custom: "Firmenname (optional)" },        type: "text", optional: true },
+        { key: "company_tax_number", label: { type: "custom", custom: "Steuernummer / VAT (optional)" }, type: "text", optional: true },
       ],
+
+      // verhindert “automatisch immer neuen Customer” falls mal kein customer gesetzt wird
+      customer_creation: "if_required",
     };
 
-    // Hardening: niemals dieses Feld setzen (SOP §3.1)
+    // niemals setzen (SOP)
     delete sessionParams.customer_email;
 
-    // Nur setzen, wenn wir VORHER einen Customer mit Defaults erstellt haben!
     if (customerId) sessionParams.customer = customerId;
 
     if (mode === "payment") {
       sessionParams.invoice_creation = {
         enabled: true,
         invoice_data: {
-          // KEIN auto_advance → nicht dokumentiert in Sessions-invoice_data
+          // KEIN auto_advance hier – Finalisierung macht der Webhook
           footer: "Reverse Charge – Die Steuerschuldnerschaft liegt beim Leistungsempfänger.",
           metadata: { plan },
         },
@@ -117,10 +112,7 @@ export default async function handler(req, res) {
   }
 }
 
-function trimOrNull(v) {
-  const s = (v ?? "").toString().trim();
-  return s.length ? s : null;
-}
+function trimOrNull(v) { const s = (v ?? "").toString().trim(); return s.length ? s : null; }
 async function readJson(req) {
   const chunks = [];
   for await (const x of req) chunks.push(x);
