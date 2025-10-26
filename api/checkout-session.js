@@ -1,6 +1,6 @@
 // api/checkout-session.js
 export default async function handler(req, res) {
-  // --- CORS erlaubte Origins wie bei dir ---
+  // --- CORS erlaubte Origins ---
   const ALLOWED = [
     "https://ai-business-engine.com",
     "https://www.ai-business-engine.com",
@@ -19,8 +19,9 @@ export default async function handler(req, res) {
   const stripe = (await import("stripe")).default(stripeSecret, { apiVersion: "2020-08-27" });
 
   try {
-    // Wir lesen die Form-Felder, pre-füllen aber NICHT die Checkout-Email.
-    const { plan = "one_time", email = "", name = "", thankYouUrl } = await readJson(req);
+    // Wir lesen nur plan & Ziel-URL. E-Mail/Name werden NICHT an Stripe durchgereicht (SOP 3.1).
+    // Frontend kann 'thankYouUrl' oder 'successUrl' schicken – wir mappen beides.
+    const { plan = "one_time", thankYouUrl, successUrl } = await readJson(req);
 
     const PRICE_ONE_TIME = process.env.PRICE_ONE_TIME;
     const PRICE_SPLIT_2  = process.env.PRICE_SPLIT_2;
@@ -41,20 +42,20 @@ export default async function handler(req, res) {
     const isSub = ["split_2", "aibe_split_2", "split_3", "aibe_split_3"].includes(plan);
     const mode = isSub ? "subscription" : "payment";
 
-    // --- Basiskonfiguration der Session ---
+    // --- Session-Payload (ohne customer_email) ---
     const sessionParams = {
       ui_mode: "embedded",
       mode,
       line_items: [{ price, quantity: 1 }],
-      // embedded flow -> return_url
+      // Embedded-Flow nutzt return_url (successUrl/thankYouUrl werden unterstützt)
       return_url:
-        `${thankYouUrl || "https://ai-business-engine.com/thank-you"}?plan=${encodeURIComponent(plan)}&total=${totals[plan] || ""}&session_id={CHECKOUT_SESSION_ID}`,
-      // Rechnungsadresse erzwingen (brauchst du für den Adress-Block)
+        `${(thankYouUrl || successUrl || "https://ai-business-engine.com/thank-you")}`
+        + `?plan=${encodeURIComponent(plan)}&total=${totals[plan] || ""}&session_id={CHECKOUT_SESSION_ID}`,
       billing_address_collection: "required",
       tax_id_collection: { enabled: false },
       phone_number_collection: { enabled: false },
 
-      // Custom Fields einsammeln (Firmenname & Steuernummer)
+      // Custom Fields für Rechnung (optional)
       custom_fields: [
         {
           key: "company_name",
@@ -69,35 +70,39 @@ export default async function handler(req, res) {
           optional: true,
         },
       ],
-
-      // KEINE Vorbelegung der E-Mail (damit das Feld nicht ausgegraut ist)
-      customer_email: null,
     };
 
-    // --- Metadaten nur fürs Mapping/Debug (beeinflusst Checkout-Felder nicht) ---
+    // SOP 3.1: harte Absicherung – niemals customer_email/customer an Stripe senden
+    delete sessionParams.customer_email;
+    delete sessionParams.customer;
+
+    // Metadaten nur fürs spätere Mapping/Debugging – ohne Checkout-Felder zu beeinflussen
     if (mode === "payment") {
-      // Rechnungserstellung an – ohne auto_advance (dieser Param ist hier nicht erlaubt)
       sessionParams.invoice_creation = {
         enabled: true,
+        // KEIN invoice_data.auto_advance hier (SOP 3.2)!
         invoice_data: {
-          footer:
-            "Reverse Charge – Die Steuerschuldnerschaft liegt beim Leistungsempfänger.",
-          metadata: { plan, form_email: email || "", form_name: name || "" },
+          footer: "Reverse Charge – Die Steuerschuldnerschaft liegt beim Leistungsempfänger.",
+          // Nur Debug/Mapping – keine Checkout-Felder
+          metadata: { plan },
         },
       };
       sessionParams.payment_intent_data = {
-        metadata: { plan, form_email: email || "", form_name: name || "" },
+        metadata: { plan },
       };
     } else {
-      // Subscription: Mapping nur in Metadata, Anpassungen später per Webhook
       sessionParams.subscription_data = {
-        metadata: { plan, form_email: email || "", form_name: name || "" },
+        metadata: { plan },
       };
     }
 
     const session = await stripe.checkout.sessions.create(sessionParams);
-    // Dein Frontend erwartet nur den client_secret
-    return res.status(200).json({ client_secret: session.client_secret });
+
+    // Frontend erwartet client_secret; ver-Marker hilft bei Live-Diagnose (SOP 3.1)
+    return res.status(200).json({
+      client_secret: session.client_secret,
+      ver: "no-email-guard-20251024",
+    });
   } catch (e) {
     console.error("[session] error", e);
     return res.status(500).json({ error: e.message || "session_error" });
