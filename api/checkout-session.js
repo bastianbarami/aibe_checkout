@@ -88,10 +88,10 @@ export default async function handler(req, res) {
 
     // One-time vs. Subscription – nur Metadaten, KEINE invoice_creation
     if (mode === "payment") {
-      sessionParams.payment_intent_data = { metadata: { plan } };
-    } else {
-      sessionParams.subscription_data = { metadata: { plan } };
-    }
+  sessionParams.payment_intent_data = {};
+} else {
+  sessionParams.subscription_data = {};
+}
 
     // --- Optional: Promotion Code automatisch anwenden (wenn übergeben) ---
     if (promotionCode) {
