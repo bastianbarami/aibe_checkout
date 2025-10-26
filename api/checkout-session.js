@@ -91,13 +91,10 @@ export default async function handler(req, res) {
     if (customerId) sessionParams.customer = customerId;
 
     if (mode === "payment") {
-      sessionParams.invoice_creation = {
-        enabled: true,
-        invoice_data: {
-          // KEIN auto_advance hier – Finalisierung macht der Webhook
-          footer: "Reverse Charge – Die Steuerschuldnerschaft liegt beim Leistungsempfänger.",
-          metadata: { plan },
-        },
+  // Keine automatische Rechnungserstellung durch Stripe
+  // sessionParams.invoice_creation = { enabled: true, invoice_data: {...} };    <--- entfernt
+  sessionParams.payment_intent_data = { metadata: { plan } };
+},
       };
       sessionParams.payment_intent_data = { metadata: { plan } };
     } else {
