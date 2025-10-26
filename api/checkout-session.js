@@ -1,6 +1,6 @@
 // api/checkout-session.js
 export default async function handler(req, res) {
-  // --- CORS erlaubte Origins ---
+  // --- CORS erlaubte Origins wie bei dir ---
   const ALLOWED = [
     "https://ai-business-engine.com",
     "https://www.ai-business-engine.com",
@@ -19,9 +19,9 @@ export default async function handler(req, res) {
   const stripe = (await import("stripe")).default(stripeSecret, { apiVersion: "2020-08-27" });
 
   try {
-    // Wir lesen nur plan & Ziel-URL. E-Mail/Name werden NICHT an Stripe durchgereicht (SOP 3.1).
-    // Frontend kann 'thankYouUrl' oder 'successUrl' schicken – wir mappen beides.
-    const { plan = "one_time", thankYouUrl, successUrl } = await readJson(req);
+    // ⚠️ SOP §3.1: Keine E-Mail in die Session geben (nicht einmal leer/null)!
+    // Wir lesen plan/thankYouUrl nur für interne Logik.
+    const { plan = "one_time", /* email = "", name = "", */ thankYouUrl } = await readJson(req);
 
     const PRICE_ONE_TIME = process.env.PRICE_ONE_TIME;
     const PRICE_SPLIT_2  = process.env.PRICE_SPLIT_2;
@@ -42,20 +42,20 @@ export default async function handler(req, res) {
     const isSub = ["split_2", "aibe_split_2", "split_3", "aibe_split_3"].includes(plan);
     const mode = isSub ? "subscription" : "payment";
 
-    // --- Session-Payload (ohne customer_email) ---
+    // --- Basiskonfiguration der Session ---
     const sessionParams = {
       ui_mode: "embedded",
       mode,
       line_items: [{ price, quantity: 1 }],
-      // Embedded-Flow nutzt return_url (successUrl/thankYouUrl werden unterstützt)
+      // embedded flow -> return_url
       return_url:
-        `${(thankYouUrl || successUrl || "https://ai-business-engine.com/thank-you")}`
-        + `?plan=${encodeURIComponent(plan)}&total=${totals[plan] || ""}&session_id={CHECKOUT_SESSION_ID}`,
+        `${thankYouUrl || "https://ai-business-engine.com/thank-you"}?plan=${encodeURIComponent(plan)}&total=${totals[plan] || ""}&session_id={CHECKOUT_SESSION_ID}`,
+      // Rechnungsadresse erzwingen (Adressblock)
       billing_address_collection: "required",
       tax_id_collection: { enabled: false },
       phone_number_collection: { enabled: false },
 
-      // Custom Fields für Rechnung (optional)
+      // Custom Fields einsammeln (Firmenname & Steuernummer)
       custom_fields: [
         {
           key: "company_name",
@@ -70,20 +70,23 @@ export default async function handler(req, res) {
           optional: true,
         },
       ],
+
+      // ⚠️ SOP §3.1: KEIN customer_email, KEIN customer setzen!
+      // (Feld darf GAR NICHT existieren)
     };
 
-    // SOP 3.1: harte Absicherung – niemals customer_email/customer an Stripe senden
+    // 🔒 Hardening-Guard (falls später mal versehentlich ergänzt):
     delete sessionParams.customer_email;
     delete sessionParams.customer;
 
-    // Metadaten nur fürs spätere Mapping/Debugging – ohne Checkout-Felder zu beeinflussen
+    // --- Optionale Rechnungsentwurfs-Erzeugung (erlaubt), aber KEIN auto_advance! (SOP §3.2)
     if (mode === "payment") {
       sessionParams.invoice_creation = {
         enabled: true,
-        // KEIN invoice_data.auto_advance hier (SOP 3.2)!
         invoice_data: {
+          // ⚠️ kein auto_advance hier!
           footer: "Reverse Charge – Die Steuerschuldnerschaft liegt beim Leistungsempfänger.",
-          // Nur Debug/Mapping – keine Checkout-Felder
+          // Metadaten nur fürs Mapping/Debug
           metadata: { plan },
         },
       };
@@ -98,11 +101,8 @@ export default async function handler(req, res) {
 
     const session = await stripe.checkout.sessions.create(sessionParams);
 
-    // Frontend erwartet client_secret; ver-Marker hilft bei Live-Diagnose (SOP 3.1)
-    return res.status(200).json({
-      client_secret: session.client_secret,
-      ver: "no-email-guard-20251024",
-    });
+    // Kleine Laufzeitmarke zum schnellen Verifizieren des Deploys (SOP 3.1.2d)
+    return res.status(200).json({ client_secret: session.client_secret, ver: "no-email-guard" });
   } catch (e) {
     console.error("[session] error", e);
     return res.status(500).json({ error: e.message || "session_error" });
