@@ -3,37 +3,37 @@ import { buffer } from "micro";
 import Stripe from "stripe";
 
 export const config = {
-  api: { bodyParser: false }, // raw body für Signaturprüfung
+  api: { bodyParser: false },
   runtime: "nodejs",
 };
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: "2020-08-27" });
 const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
-/** Utils */
-function trimOrNull(v) {
-  const s = (v ?? "").toString().trim();
-  return s.length ? s : null;
-}
+/** --- Utils --- */
+function trimOrNull(v) { const s = (v ?? "").toString().trim(); return s.length ? s : null; }
+
 function getCompanyFieldsFromSession(session) {
   const out = { companyName: null, taxNumber: null };
-  const fields = session?.custom_fields || [];
-  for (const f of fields) {
-    if (f?.key === "company_name")       out.companyName = trimOrNull(f?.text?.value);
-    if (f?.key === "company_tax_number") out.taxNumber  = trimOrNull(f?.text?.value);
+  for (const f of (session?.custom_fields || [])) {
+    if (f?.key === "company_name") out.companyName = trimOrNull(f?.text?.value);
+    if (f?.key === "company_tax_number") out.taxNumber = trimOrNull(f?.text?.value);
   }
   return out;
 }
+
 function buildInvoiceCustomFields({ companyName, taxNumber }) {
   const arr = [];
   if (companyName) arr.push({ name: "Company", value: companyName });
   if (taxNumber)   arr.push({ name: "Tax ID", value: taxNumber });
   return arr.length ? arr : null;
 }
+
 async function findLatestDraftInvoiceForCustomer(customerId) {
-  const list = await stripe.invoices.list({ customer: customerId, limit: 1, status: "draft" });
+  const list = await stripe.invoices.list({ customer: customerId, status: "draft", limit: 1 });
   return list.data?.[0] || null;
 }
+
 async function setCustomerInvoiceDefaults(customerId, fields, eventId) {
   const customFields = buildInvoiceCustomFields(fields);
   if (!customFields) return;
@@ -43,30 +43,43 @@ async function setCustomerInvoiceDefaults(customerId, fields, eventId) {
     { idempotencyKey: `cust-invoice-defaults-${customerId}-${eventId}` }
   );
 }
-async function applyFieldsAndFinalizeDraftInvoice(invoice, fields, eventId) {
-  if (!invoice || invoice.status !== "draft") return;
-  const customFields = buildInvoiceCustomFields(fields);
-  if (!customFields) return;
 
-  // Nur Drafts bearbeiten, niemals finalized/open
+async function applyFieldsToDraft(invoice, fields, eventId) {
+  if (!invoice || invoice.status !== "draft") return false;
+  const customFields = buildInvoiceCustomFields(fields);
+  if (!customFields) return false;
+
   await stripe.invoices.update(
     invoice.id,
-    { custom_fields: customFields },
+    {
+      custom_fields: customFields,
+      // erlaubt & sicher auf 2020-08-27; verhindert auto-Finalisierung durch Rules
+      auto_advance: false,
+    },
     { idempotencyKey: `inv-update-${invoice.id}-${eventId}` }
   );
+  return true;
+}
 
+async function finalizeInvoice(invoiceId, eventId) {
   await stripe.invoices.finalizeInvoice(
-    invoice.id,
-    { idempotencyKey: `inv-finalize-${invoice.id}-${eventId}` }
+    invoiceId,
+    { idempotencyKey: `inv-finalize-${invoiceId}-${eventId}` }
   );
 }
+
 async function stashFieldsOnCustomer(customerId, fields, eventId) {
   const meta = {};
   if (fields.companyName) meta.company_name_from_checkout = fields.companyName;
   if (fields.taxNumber)   meta.company_tax_number_from_checkout = fields.taxNumber;
   if (!Object.keys(meta).length) return;
-  await stripe.customers.update(customerId, { metadata: meta }, { idempotencyKey: `cust-stash-${customerId}-${eventId}` });
+  await stripe.customers.update(
+    customerId,
+    { metadata: meta },
+    { idempotencyKey: `cust-stash-${customerId}-${eventId}` }
+  );
 }
+
 function readStashedFieldsFromCustomer(customer) {
   const m = customer?.metadata || {};
   return {
@@ -75,9 +88,21 @@ function readStashedFieldsFromCustomer(customer) {
   };
 }
 
-/** Webhook */
+function readInvoiceSettingsFields(customer) {
+  const cf = customer?.invoice_settings?.custom_fields || null;
+  if (!cf || !cf.length) return { companyName: null, taxNumber: null };
+  let companyName = null, taxNumber = null;
+  for (const f of cf) {
+    if (f?.name === "Company") companyName = trimOrNull(f?.value);
+    if (f?.name === "Tax ID")  taxNumber  = trimOrNull(f?.value);
+  }
+  return { companyName, taxNumber };
+}
+
+/** --- Webhook --- */
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).end("Method Not Allowed");
+  if (!endpointSecret) return res.status(500).end("Missing STRIPE_WEBHOOK_SECRET");
 
   let event;
   try {
@@ -91,13 +116,6 @@ export default async function handler(req, res) {
 
   try {
     switch (event.type) {
-      /**
-       * Bevor irgendeine Finalisierung passieren kann:
-       * - Session laden (expand)
-       * - Custom Fields lesen
-       * - Customer-Defaults setzen (so übernimmt JEDE neue Draft-Invoice die Felder)
-       * - Falls die erste Invoice bereits als Draft existiert: patchen & finalisieren
-       */
       case "checkout.session.completed": {
         const sessionId = event.data.object.id;
         const session = await stripe.checkout.sessions.retrieve(sessionId, {
@@ -108,23 +126,25 @@ export default async function handler(req, res) {
         const customerId = session.customer || session.customer_id;
 
         if (customerId) {
+          // 1) Defaults setzen + Fallback stashen
           await setCustomerInvoiceDefaults(customerId, fields, event.id);
           await stashFieldsOnCustomer(customerId, fields, event.id);
         }
 
-        // Wenn die erste Rechnung bereits existiert und noch Draft ist → jetzt patchen & finalisieren.
+        // 2) Falls die erste Rechnung bereits existiert (Draft) → patchen **und direkt finalisieren**
         let invoice = session.invoice || null;
         if (!invoice && customerId) invoice = await findLatestDraftInvoiceForCustomer(customerId);
         if (invoice && invoice.status === "draft") {
-          await applyFieldsAndFinalizeDraftInvoice(invoice, fields, event.id);
+          const patched = await applyFieldsToDraft(invoice, fields, event.id);
+          if (patched) {
+            // kurze Pause ist optional; unter 10s bleiben
+            await new Promise(r => setTimeout(r, 1000));
+            await finalizeInvoice(invoice.id, event.id);
+          }
         }
         break;
       }
 
-      /**
-       * Fallback: Manche Flows erzeugen Draft-Invoices vor/ohne completed-Event-Race.
-       * Hier nutzen wir die beim Customer zuvor gestashten Felder.
-       */
       case "invoice.created": {
         const invoice = event.data.object;
         if (invoice?.status !== "draft") break;
@@ -132,17 +152,25 @@ export default async function handler(req, res) {
         const customerId = invoice.customer;
         if (!customerId) break;
 
+        // Customer laden und beide Quellen prüfen
         const customer = await stripe.customers.retrieve(customerId);
-        const fields = readStashedFieldsFromCustomer(customer);
+        const fromInvoiceSettings = readInvoiceSettingsFields(customer);
+        const fromStash = readStashedFieldsFromCustomer(customer);
+
+        const fields = {
+          companyName: fromInvoiceSettings.companyName || fromStash.companyName,
+          taxNumber:   fromInvoiceSettings.taxNumber   || fromStash.taxNumber,
+        };
         if (!fields.companyName && !fields.taxNumber) break;
 
-        await applyFieldsAndFinalizeDraftInvoice(invoice, fields, event.id);
+        const patched = await applyFieldsToDraft(invoice, fields, event.id);
+        if (patched) {
+          await new Promise(r => setTimeout(r, 1000));
+          await finalizeInvoice(invoice.id, event.id);
+        }
         break;
       }
 
-      // Keine Aktion nötig
-      case "invoice.payment_succeeded":
-      case "invoice.finalized":
       default:
         break;
     }
@@ -150,7 +178,7 @@ export default async function handler(req, res) {
     return res.json({ received: true });
   } catch (err) {
     console.error("[WH] handler error:", err);
-    // Idempotent & kein endloses Retry
+    // bewusst 200, Operationen sind idempotent
     return res.json({ received: true, warn: "handler_error" });
   }
 }
