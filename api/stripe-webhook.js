@@ -32,7 +32,7 @@ function getCompanyFieldsFromSession(session) {
   return out;
 }
 
-/** baut Invoice.custom_fields Array nur mit vorhandenen Werten */
+/** Baut Invoice.custom_fields Array nur mit vorhandenen Werten */
 function buildInvoiceCustomFields({ companyName, taxNumber }) {
   const arr = [];
   if (companyName) arr.push({ name: "Company", value: companyName });
@@ -50,33 +50,38 @@ async function findLatestDraftInvoiceForCustomer(customerId) {
   return list.data?.[0] || null;
 }
 
-/** Setzt Felder in die Rechnung und finalisiert sie (idempotent pro eventId) */
-async function applyFieldsAndFinalizeInvoice(invoice, fields, eventId) {
-  const { companyName, taxNumber } = fields || {};
-  const customFields = buildInvoiceCustomFields({ companyName, taxNumber });
-
-  // Nichts zu tun?
+/** Setzt Customer-Defaults für Invoices (robusteste Variante, SOP 4.4) */
+async function setCustomerInvoiceDefaults(customerId, fields, eventId) {
+  const customFields = buildInvoiceCustomFields(fields);
   if (!customFields) return;
 
-  // Update-Params für die Rechnung (SOP 3.3: KEIN customer_name hier!)
-  const updateParams = { custom_fields: customFields };
-
-  // Invoice updaten (idempotent pro Event)
-  const idempotencyKey = `inv-update-${invoice.id}-${eventId}`;
-  await stripe.invoices.update(invoice.id, updateParams, { idempotencyKey });
-
-  // Finalisieren, falls noch Entwurf / offen
-  if (invoice.status === "draft" || invoice.status === "open") {
-    const idempotencyKeyFinalize = `inv-finalize-${invoice.id}-${eventId}`;
-    await stripe.invoices.finalizeInvoice(
-      invoice.id,
-      {},
-      { idempotencyKey: idempotencyKeyFinalize }
-    );
-  }
+  await stripe.customers.update(
+    customerId,
+    { invoice_settings: { custom_fields: customFields } },
+    { idempotencyKey: `cust-invoice-defaults-${customerId}-${eventId}` }
+  );
 }
 
-/** Fallback: Werte temporär am Customer ablegen (Metadata), damit invoice.created sie greifen kann */
+/** Nur wenn die Rechnung noch DRAFT ist: Felder setzen & finalisieren */
+async function applyFieldsAndFinalizeDraftInvoice(invoice, fields, eventId) {
+  if (!invoice || invoice.status !== "draft") return;
+
+  const customFields = buildInvoiceCustomFields(fields);
+  if (!customFields) return;
+
+  // ⚠️ SOP §3.3: KEIN customer_name auf Invoice-Ebene setzen!
+  const idempotencyKey = `inv-update-${invoice.id}-${eventId}`;
+  await stripe.invoices.update(
+    invoice.id,
+    { custom_fields: customFields },
+    { idempotencyKey }
+  );
+
+  const idempotencyKeyFinalize = `inv-finalize-${invoice.id}-${eventId}`;
+  await stripe.invoices.finalizeInvoice(invoice.id, { idempotencyKey: idempotencyKeyFinalize });
+}
+
+/** Fallback: Werte am Customer.metadata ablegen (für spätere Rechnungen, optional) */
 async function stashFieldsOnCustomer(customerId, fields, eventId) {
   const meta = {};
   if (fields.companyName) meta.company_name_from_checkout = fields.companyName;
@@ -90,7 +95,6 @@ async function stashFieldsOnCustomer(customerId, fields, eventId) {
   );
 }
 
-/** Liest Fallback-Werte vom Customer.metadata wieder aus */
 function readStashedFieldsFromCustomer(customer) {
   const m = customer?.metadata || {};
   const companyName = (m.company_name_from_checkout || "").trim() || null;
@@ -117,7 +121,7 @@ export default async function handler(req, res) {
 
   try {
     switch (event.type) {
-      // Hauptpfad: Session fertig → Felder auslesen und (wenn möglich) in Draft-Invoice schreiben
+      // Präferierter Pfad: Session erfolgreich -> Customer-Defaults setzen (VOR Rechnungserstellung)
       case "checkout.session.completed": {
         const sessionId = event.data.object.id;
         const session = await stripe.checkout.sessions.retrieve(sessionId, {
@@ -126,50 +130,54 @@ export default async function handler(req, res) {
 
         const fields = getCompanyFieldsFromSession(session);
         const customerId = session.customer || session.customer_id;
+
+        // 1) Customer-Defaults für künftige/aktuelle Invoice setzen (robust, SOP 4.4)
+        if (customerId) {
+          await setCustomerInvoiceDefaults(customerId, fields, event.id);
+          await stashFieldsOnCustomer(customerId, fields, event.id); // optionaler Fallback
+        }
+
+        // 2) Falls die (erste) Rechnung hier noch DRAFT ist, direkt patchen & finalisieren
         let invoice = session.invoice || null;
-
-        // Falls Invoice hier nicht expandiert wurde, versuchen wir, die neueste Draft-Invoice zu finden
         if (!invoice && customerId) {
-          const draft = await findLatestDraftInvoiceForCustomer(customerId);
-          if (draft) invoice = draft;
+          invoice = await findLatestDraftInvoiceForCustomer(customerId);
+        }
+        if (invoice && invoice.status === "draft") {
+          await applyFieldsAndFinalizeDraftInvoice(invoice, fields, event.id);
         }
 
-        if (invoice) {
-          await applyFieldsAndFinalizeInvoice(invoice, fields, event.id);
-        } else if (customerId) {
-          // Fallback: stash am Customer, damit invoice.created kurz danach zugreifen kann
-          await stashFieldsOnCustomer(customerId, fields, event.id);
-        }
         break;
       }
 
-      // Fallback-Pfad: Rechnung als Entwurf erzeugt → Felder vom Customer-Metadata übernehmen, dann finalisieren
+      // Fallback-Pfad: Entwurfsrechnung wird erstellt (z.B. Subscription oder Race-Condition)
       case "invoice.created": {
         const invoice = event.data.object;
-        if (!invoice?.customer) break;
+        if (invoice?.status !== "draft") break;
 
-        // Customer laden & gestashte Felder lesen
-        const customer = await stripe.customers.retrieve(invoice.customer);
+        const customerId = invoice.customer;
+        if (!customerId) break;
+
+        // Aus Customer.metadata (Fallback) lesen
+        const customer = await stripe.customers.retrieve(customerId);
         const fields = readStashedFieldsFromCustomer(customer);
-
         if (!fields.companyName && !fields.taxNumber) break;
 
-        await applyFieldsAndFinalizeInvoice(invoice, fields, event.id);
+        await applyFieldsAndFinalizeDraftInvoice(invoice, fields, event.id);
         break;
       }
 
-      // Für Vollständigkeit – keine Aktion nötig
-      case "invoice.finalized":
+      // Für Vollständigkeit: keine weiteren Aktionen nötig
       case "invoice.payment_succeeded":
+      case "invoice.finalized":
       default:
         break;
     }
 
-    // Immer 200, damit Stripe nicht erneut sendet (idempotent)
+    // Immer 200, damit Stripe nicht erneut sendet
     return res.json({ received: true });
   } catch (err) {
     console.error("[WH] handler error:", err);
-    // Trotzdem 200 zurückgeben, um Endless-Retries zu vermeiden (wir arbeiten idempotent)
+    // Trotzdem 200 zurückgeben, um Endless-Retries zu vermeiden (Operationen sind idempotent)
     return res.json({ received: true, warn: "handler_error" });
   }
 }
