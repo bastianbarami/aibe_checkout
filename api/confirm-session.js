@@ -1,111 +1,57 @@
-// api/checkout-session.js
+// /api/confirm-session.js
 export default async function handler(req, res) {
-  // --- CORS erlaubte Origins wie bei dir ---
-  const ALLOWED = [
-    "https://ai-business-engine.com",
-    "https://www.ai-business-engine.com",
-    "https://baramiai-c98bd4c508b71b1b1c91ae95c029fc.webflow.io",
-  ];
-  const origin = req.headers.origin || "";
-  if (ALLOWED.includes(origin)) res.setHeader("Access-Control-Allow-Origin", origin);
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST") return res.status(405).end("Method Not Allowed");
-
-  // --- Stripe init ---
-  const stripeSecret = process.env.STRIPE_SECRET_KEY;
-  if (!stripeSecret) return res.status(500).json({ error: "Missing STRIPE_SECRET_KEY" });
-  const stripe = (await import("stripe")).default(stripeSecret, { apiVersion: "2020-08-27" });
-
   try {
-    // Wir lesen die Form-Felder, pre-füllen aber NICHT die Checkout-Email.
-    const { plan = "one_time", email = "", name = "", thankYouUrl } = await readJson(req);
+    const ALLOWED = new Set([
+      "https://ai-business-engine.com",
+      "https://www.ai-business-engine.com",
+      "https://baramiai-c98bd4c508b71b1b1c91ae95c029fc.webflow.io",
+    ]);
+    const origin = req.headers.origin || "";
+    if (ALLOWED.has(origin)) res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    if (req.method === "OPTIONS") return res.status(200).json({ ok: true });
+    if (req.method !== "POST")   return res.status(405).json({ error: "Method Not Allowed" });
 
-    const PRICE_ONE_TIME = process.env.PRICE_ONE_TIME;
-    const PRICE_SPLIT_2  = process.env.PRICE_SPLIT_2;
-    const PRICE_SPLIT_3  = process.env.PRICE_SPLIT_3;
+    const stripeSecret = process.env.STRIPE_SECRET_KEY;
+    if (!stripeSecret) return res.status(500).json({ error: "Missing STRIPE_SECRET_KEY" });
+    const stripe = (await import("stripe")).default(stripeSecret, { apiVersion: "2020-08-27" });
 
-    const priceMap = {
-      one_time: PRICE_ONE_TIME,
-      split_2:  PRICE_SPLIT_2,
-      split_3:  PRICE_SPLIT_3,
-      aibe_pif: PRICE_ONE_TIME,
-      aibe_split_2: PRICE_SPLIT_2,
-      aibe_split_3: PRICE_SPLIT_3,
-    };
-    const totals = { aibe_pif: 499, aibe_split_2: 515, aibe_split_3: 525 };
-    const price = priceMap[plan];
-    if (!price) return res.status(400).json({ error: "Unknown plan" });
+    const { session_id } = await readJson(req);
+    if (!session_id) return res.status(400).json({ error: "Missing session_id" });
 
-    const isSub = ["split_2", "aibe_split_2", "split_3", "aibe_split_3"].includes(plan);
-    const mode = isSub ? "subscription" : "payment";
+    const session = await stripe.checkout.sessions.retrieve(session_id, {
+      expand: ["customer", "invoice", "payment_intent", "subscription"]
+    });
 
-    // --- Basiskonfiguration der Session ---
-    const sessionParams = {
-      ui_mode: "embedded",
-      mode,
-      line_items: [{ price, quantity: 1 }],
-      // embedded flow -> return_url
-      return_url:
-        `${thankYouUrl || "https://ai-business-engine.com/thank-you"}?plan=${encodeURIComponent(plan)}&total=${totals[plan] || ""}&session_id={CHECKOUT_SESSION_ID}`,
-      // Rechnungsadresse erzwingen (brauchst du für den Adress-Block)
-      billing_address_collection: "required",
-      tax_id_collection: { enabled: false },
-      phone_number_collection: { enabled: false },
-
-      // Custom Fields einsammeln (Firmenname & Steuernummer)
-      custom_fields: [
-        {
-          key: "company_name",
-          label: { type: "custom", custom: "Firmenname (optional)" },
-          type: "text",
-          optional: true,
-        },
-        {
-          key: "company_tax_number",
-          label: { type: "custom", custom: "Steuernummer / VAT (optional)" },
-          type: "text",
-          optional: true,
-        },
-      ],
-
-      // ⚠️ Kein customer_email mitsenden, wenn wir keine valide E-Mail haben
-      // (vorher: customer_email: null -> führte zu "Invalid email address")
-    };
-
-    // --- Metadaten nur fürs Mapping/Debug (beeinflusst Checkout-Felder nicht) ---
-    if (mode === "payment") {
-      // Rechnung als ENTWURF erzeugen (Finalisierung im Webhook)
-      sessionParams.invoice_creation = {
-        enabled: true,
-        invoice_data: {
-          footer:
-            "Reverse Charge – Die Steuerschuldnerschaft liegt beim Leistungsempfänger.",
-          metadata: { plan, form_email: email || "", form_name: name || "" },
-        },
-      };
-      sessionParams.payment_intent_data = {
-        metadata: { plan, form_email: email || "", form_name: name || "" },
-      };
-    } else {
-      // Subscription-Fall
-      sessionParams.subscription_data = {
-        metadata: { plan, form_email: email || "", form_name: name || "" },
-      };
-    }
-
-    const session = await stripe.checkout.sessions.create(sessionParams);
-    return res.status(200).json({ client_secret: session.client_secret });
+    // Nur sichere Felder zurückgeben (read-only)
+    return res.status(200).json({
+      id: session.id,
+      mode: session.mode,                               // payment | subscription
+      status: session.status,                           // open | complete | expired
+      payment_status: session.payment_status,           // paid | unpaid | no_payment_required
+      currency: session.currency,
+      amount_total: session.amount_total,
+      customer_id: session.customer || session.customer_id || null,
+      subscription_id: session.subscription || null,
+      invoice_id: session.invoice?.id || null,
+      hosted_invoice_url: session.invoice?.hosted_invoice_url || null,
+      invoice_pdf: session.invoice?.invoice_pdf || null,
+      // Custom Fields aus Checkout (falls für UTM/Make gebraucht)
+      custom_fields: (session.custom_fields || []).map(f => ({
+        key: f.key,
+        value: f?.text?.value ?? null
+      })),
+    });
   } catch (e) {
-    console.error("[session] error", e);
-    return res.status(500).json({ error: e.message || "session_error" });
+    console.error("[confirm-session] error", e);
+    return res.status(500).json({ error: e?.message || "confirm_error" });
   }
 }
 
-async function readJson(req) {
-  const chunks = [];
-  for await (const x of req) chunks.push(x);
-  const raw = Buffer.concat(chunks).toString("utf8") || "{}";
+async function readJson(req){
+  const chunks=[]; for await (const x of req) chunks.push(x);
+  const raw=Buffer.concat(chunks).toString("utf8")||"{}";
   return JSON.parse(raw);
 }
