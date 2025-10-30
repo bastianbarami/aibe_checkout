@@ -46,8 +46,15 @@ async function applyFieldsToDraft(invoice, fields, eventId) {
   if (!customFields) return;
   await stripe.invoices.update(
     invoice.id,
-    { custom_fields: customFields, auto_advance: false }, // bleibt Draft
+    { custom_fields: customFields, auto_advance: false }, // stays draft  
     { idempotencyKey: `inv-update-${invoice.id}-${eventId}` }
+  );
+}
+async function pauseAutoAdvance(invoiceId, eventId) {
+  await stripe.invoices.update(
+    invoiceId,
+    { auto_advance: false },
+    { idempotencyKey: `inv-pause-${invoiceId}-${eventId}` }
   );
 }
 async function finalizeInvoice(invoiceId, eventId) {
@@ -56,12 +63,22 @@ async function finalizeInvoice(invoiceId, eventId) {
     { idempotencyKey: `inv-finalize-${invoiceId}-${eventId}` }
   );
 }
+async function payInvoice(invoiceId, eventId) {
+  await stripe.invoices.pay(
+    invoiceId,
+    { idempotencyKey: `inv-pay-${invoiceId}-${eventId}` }
+  );
+}
 async function stashFieldsOnCustomer(customerId, fields, eventId) {
   const meta = {};
   if (fields.companyName) meta.company_name_from_checkout = fields.companyName;
   if (fields.taxNumber)   meta.company_tax_number_from_checkout = fields.taxNumber;
   if (!Object.keys(meta).length) return;
-  await stripe.customers.update(customerId, { metadata: meta }, { idempotencyKey: `cust-stash-${customerId}-${eventId}` });
+  await stripe.customers.update(
+    customerId,
+    { metadata: meta },
+    { idempotencyKey: `cust-stash-${customerId}-${eventId}` }
+  );
 }
 function readStashedFieldsFromCustomer(customer) {
   const m = customer?.metadata || {};
@@ -90,7 +107,7 @@ export default async function handler(req, res) {
       case "checkout.session.completed": {
         const sessionId = event.data.object.id;
         const session = await stripe.checkout.sessions.retrieve(sessionId, {
-          expand: ["invoice", "customer", "payment_intent"],
+          expand: ["invoice", "customer", "subscription.latest_invoice", "payment_intent"],
         });
 
         const fields = getCompanyFieldsFromSession(session);
@@ -102,22 +119,35 @@ export default async function handler(req, res) {
           await stashFieldsOnCustomer(customerId, fields, event.id);
         }
 
-        // 2) Draft-Invoice suchen (kann im Session-Objekt sein oder via Suche)
-        let invoice = session.invoice || null;
-        if (!invoice && customerId) invoice = await findLatestDraftInvoiceForCustomer(customerId);
+        // 2) Draft‐Invoice ermitteln
+        let invoice = session.invoice;
+        if (!invoice && session.subscription?.latest_invoice) {
+          invoice = await stripe.invoices.retrieve(session.subscription.latest_invoice);
+        }
+        if (!invoice && customerId) {
+          invoice = await findLatestDraftInvoiceForCustomer(customerId);
+        }
 
-        // 3) Felder auf Draft anwenden, DANN finalisieren
+        // 3) Wenn Invoice existiert und ist draft → Felder anwenden → finalisieren → bezahlen
         if (invoice && invoice.status === "draft") {
           await applyFieldsToDraft(invoice, fields, event.id);
           await finalizeInvoice(invoice.id, event.id);
+          await payInvoice(invoice.id, event.id);
+        } else {
+          // Invoice war nicht draft – wir setzen nur die defaults, die Felder greifen bei Folge‐Rechnungen
+          console.log(`[WH] checkout.session.completed: invoice.status=${invoice?.status || 'none'} – skipping update/finalize.`);
         }
         break;
       }
 
       case "invoice.created": {
-        // ⚠️ NICHT finalisieren! Nur dann Felder setzen, wenn sie JETZT schon vorhanden sind.
         const invoice = event.data.object;
-        if (invoice?.status !== "draft") break;
+        if (!invoice?.id) break;
+
+        // 1) AutoAdvance sofort stoppen, damit Invoice als draft bleibt
+        await pauseAutoAdvance(invoice.id, event.id);
+
+        if (invoice.status !== "draft") break;
 
         const customerId = invoice.customer;
         if (!customerId) break;
@@ -127,7 +157,7 @@ export default async function handler(req, res) {
         if (!fields.companyName && !fields.taxNumber) break;
 
         await applyFieldsToDraft(invoice, fields, event.id);
-        // Kein finalize hier – das macht 'checkout.session.completed' später.
+        // Kein finalize hier – wartet auf checkout.session.completed
         break;
       }
 
