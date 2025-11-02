@@ -4,14 +4,24 @@ import Stripe from "stripe";
 
 export const config = { api: { bodyParser: false }, runtime: "nodejs" };
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: "2020-08-27" });
-const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+// --- Stripe init (TEST-fähig via Fallbacks) ---
+const stripe = new Stripe(
+  process.env.STRIPE_SECRET_KEY
+    || "sk_test_51KYNYQGB35pnerjHY39T9ADmFiIIHZMDP4gycSycCSuonlSmLiIB8MKJWjv9BimNadES2MJosVI6Mru0zbxEwbFO00yeeJrdaL",
+  { apiVersion: "2020-08-27" }
+);
 
-/** Utils */
+// Webhook-Signing-Secret
+const endpointSecret =
+  process.env.STRIPE_WEBHOOK_SECRET
+  || "whsec_dmmm5UvDOhlwJgjzidsvMCacg2a6O2sx";
+
+// ========== Utils ==========
 const trimOrNull = (v) => {
   const s = (v ?? "").toString().trim();
   return s.length ? s : null;
 };
+
 function getCompanyFieldsFromSession(session) {
   const out = { companyName: null, taxNumber: null };
   const fields = session?.custom_fields || [];
@@ -21,16 +31,19 @@ function getCompanyFieldsFromSession(session) {
   }
   return out;
 }
+
 function buildInvoiceCustomFields({ companyName, taxNumber }) {
   const arr = [];
   if (companyName) arr.push({ name: "Company", value: companyName });
   if (taxNumber)   arr.push({ name: "Tax ID", value: taxNumber });
   return arr.length ? arr : null;
 }
+
 async function findLatestDraftInvoiceForCustomer(customerId) {
   const list = await stripe.invoices.list({ customer: customerId, limit: 1, status: "draft" });
   return list.data?.[0] || null;
 }
+
 async function setCustomerInvoiceDefaults(customerId, fields, eventId) {
   const customFields = buildInvoiceCustomFields(fields);
   if (!customFields) return;
@@ -40,35 +53,41 @@ async function setCustomerInvoiceDefaults(customerId, fields, eventId) {
     { idempotencyKey: `cust-invoice-defaults-${customerId}-${eventId}` }
   );
 }
+
 async function applyFieldsToDraft(invoice, fields, eventId) {
   if (!invoice || invoice.status !== "draft") return;
   const customFields = buildInvoiceCustomFields(fields);
   if (!customFields) return;
   await stripe.invoices.update(
     invoice.id,
-    { custom_fields: customFields, auto_advance: false }, // stays draft  
+    { custom_fields: customFields, auto_advance: false }, // bleibt Draft
     { idempotencyKey: `inv-update-${invoice.id}-${eventId}` }
   );
 }
+
 async function pauseAutoAdvance(invoiceId, eventId) {
+  // stoppt sofortiges Finalisieren durch Stripe
   await stripe.invoices.update(
     invoiceId,
     { auto_advance: false },
     { idempotencyKey: `inv-pause-${invoiceId}-${eventId}` }
   );
 }
+
 async function finalizeInvoice(invoiceId, eventId) {
   await stripe.invoices.finalizeInvoice(
     invoiceId,
     { idempotencyKey: `inv-finalize-${invoiceId}-${eventId}` }
   );
 }
+
 async function payInvoice(invoiceId, eventId) {
   await stripe.invoices.pay(
     invoiceId,
     { idempotencyKey: `inv-pay-${invoiceId}-${eventId}` }
   );
 }
+
 async function stashFieldsOnCustomer(customerId, fields, eventId) {
   const meta = {};
   if (fields.companyName) meta.company_name_from_checkout = fields.companyName;
@@ -80,6 +99,7 @@ async function stashFieldsOnCustomer(customerId, fields, eventId) {
     { idempotencyKey: `cust-stash-${customerId}-${eventId}` }
   );
 }
+
 function readStashedFieldsFromCustomer(customer) {
   const m = customer?.metadata || {};
   return {
@@ -88,7 +108,7 @@ function readStashedFieldsFromCustomer(customer) {
   };
 }
 
-/** Webhook */
+// ========== Webhook ==========
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).end("Method Not Allowed");
 
@@ -104,6 +124,16 @@ export default async function handler(req, res) {
 
   try {
     switch (event.type) {
+      // 1) Rechnung entsteht (Draft) -> sofort Draft fixieren
+      case "invoice.created": {
+        const invoice = event.data.object;
+        if (!invoice?.id) break;
+        await pauseAutoAdvance(invoice.id, event.id); // Draft bleibt Draft
+        // Felder werden später im completed-Event gesetzt (wenn sicher vorhanden)
+        break;
+      }
+
+      // 2) Checkout abgeschlossen -> Felder sicher anwenden, finalisieren, bezahlen
       case "checkout.session.completed": {
         const sessionId = event.data.object.id;
         const session = await stripe.checkout.sessions.retrieve(sessionId, {
@@ -113,13 +143,13 @@ export default async function handler(req, res) {
         const fields = getCompanyFieldsFromSession(session);
         const customerId = session.customer || session.customer_id;
 
-        // 1) Defaults am Customer setzen (für diese & künftige Invoices)
+        // Defaults am Customer (greift auch für Folgerechnungen)
         if (customerId) {
           await setCustomerInvoiceDefaults(customerId, fields, event.id);
-          await stashFieldsOnCustomer(customerId, fields, event.id);
+          await stashFieldsOnCustomer(customerId, fields, event.id); // Fallback
         }
 
-        // 2) Draft‐Invoice ermitteln
+        // passende Draft-Invoice ermitteln
         let invoice = session.invoice;
         if (!invoice && session.subscription?.latest_invoice) {
           invoice = await stripe.invoices.retrieve(session.subscription.latest_invoice);
@@ -128,46 +158,27 @@ export default async function handler(req, res) {
           invoice = await findLatestDraftInvoiceForCustomer(customerId);
         }
 
-        // 3) Wenn Invoice existiert und ist draft → Felder anwenden → finalisieren → bezahlen
+        // Felder auf Draft anwenden -> finalisieren -> bezahlen
         if (invoice && invoice.status === "draft") {
           await applyFieldsToDraft(invoice, fields, event.id);
           await finalizeInvoice(invoice.id, event.id);
           await payInvoice(invoice.id, event.id);
         } else {
-          // Invoice war nicht draft – wir setzen nur die defaults, die Felder greifen bei Folge‐Rechnungen
-          console.log(`[WH] checkout.session.completed: invoice.status=${invoice?.status || 'none'} – skipping update/finalize.`);
+          // Keine Draft-Invoice gefunden – Defaults sind gesetzt, greifen ab nächster Rechnung
+          console.log(`[WH] checkout.session.completed: invoice.status=${invoice?.status || 'none'} – no draft to patch.`);
         }
         break;
       }
 
-      case "invoice.created": {
-        const invoice = event.data.object;
-        if (!invoice?.id) break;
-
-        // 1) AutoAdvance sofort stoppen, damit Invoice als draft bleibt
-        await pauseAutoAdvance(invoice.id, event.id);
-
-        if (invoice.status !== "draft") break;
-
-        const customerId = invoice.customer;
-        if (!customerId) break;
-
-        const customer = await stripe.customers.retrieve(customerId);
-        const fields = readStashedFieldsFromCustomer(customer);
-        if (!fields.companyName && !fields.taxNumber) break;
-
-        await applyFieldsToDraft(invoice, fields, event.id);
-        // Kein finalize hier – wartet auf checkout.session.completed
-        break;
-      }
-
       default:
+        // andere Events derzeit nicht erforderlich
         break;
     }
 
     return res.json({ received: true });
   } catch (err) {
     console.error("[WH] handler error:", err);
+    // bewusst 200 zurück, Operationen idempotent, sonst retried Stripe endlos
     return res.json({ received: true, warn: "handler_error" });
   }
 }
